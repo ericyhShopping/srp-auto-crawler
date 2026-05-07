@@ -14,55 +14,51 @@ GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjX
 # --- 2. 工具函式 ---
 
 def is_intermediate_domain(url):
-    """ 判定是否為中間轉址網域。 """
     if not url: return True
     url_lower = url.lower()
-    blacklist = [
-        "yahoo.com", "search.yahoo.com", "shopping.yahoo.com",
-        "affinity.net", "bizrate.com", "shophermedia.net", "provenpixel.com",
-        "socialiqredir.com", "discounthero.org", "magik.ly", "netsourceio.com",
-        "clickroll.net", "shopping123.com", "top-best.com",
-        "v2i8b.com", "beyondcheap.com", "intentxredir.com", "peakoptions.site"
-    ]
+    # 增加更多 Ebay 相關追蹤網域
+    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "affinity.net", "bizrate.com", "ebay.com/rover", "rover.ebay.com"]
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
-    """ 判定 404 關鍵字與連結效力。 """
     try:
         current_url = page.url
+        page_title = page.title().lower()
+        
+        # Ebay 特別處理：只要網址裡有 ebay.com 且不是跳轉頁，直接算 Yes
+        if "ebay.com" in current_url and not is_intermediate_domain(current_url):
+            return "Yes"
+            
         if is_intermediate_domain(current_url): return "Error"
         if not response: return "No"
 
-        page_title = page.title().lower()
         page_content = page.content().lower()
         not_found_keywords = ["page not found", "404", "dead end", "page cannot be found"]
-        
-        if any(k in page_title for k in not_found_keywords) or \
-           any(k in page_content for k in not_found_keywords):
+        if any(k in page_title for k in not_found_keywords) or any(k in page_content for k in not_found_keywords):
             return "404"
 
         status = response.status
         if status == 403 or "access denied" in page_title: return "Yes"
-        if status >= 400: return "No"
         return "Yes" if 200 <= status < 300 else "No"
-    except:
-        return "No"
+    except: return "No"
 
 def wait_for_redirect_smart(page, initial_url):
-    """ 追蹤轉址直到脫離 Yahoo。 """
+    """ 強力加速版：縮短等待時間，防止在單一站點卡死超過 1 小時 """
     try:
-        resp = page.goto(initial_url, wait_until="commit", timeout=60000)
-        for _ in range(12): 
+        # 縮短 goto 等待，只要 commit (伺服器回應) 就好
+        resp = page.goto(initial_url, wait_until="commit", timeout=30000)
+        
+        # 最多等待 5 次 (約 12 秒)，跳不走就放棄
+        for _ in range(5): 
             if not is_intermediate_domain(page.url):
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(1000) 
                 return resp
-            page.mouse.move(random.randint(100, 300), random.randint(100, 300))
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(2500) 
         return resp
     except:
         return None
 
-# --- 3. 核心抓取函式 (這部分你原本漏掉了) ---
+# --- 3. 核心抓取函式 ---
 
 def run_retailer_capture(page, row, column_order):
     retailer = str(row.get('Retailer', 'N/A'))
@@ -72,24 +68,28 @@ def run_retailer_capture(page, row, column_order):
     data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
     try:
-        page.goto(srp_url, wait_until="load", timeout=60000)
-        time.sleep(3)
+        # 設定整個 Retailer 抓取的總時限，防止卡死
+        page.goto(srp_url, wait_until="load", timeout=30000)
+        time.sleep(2)
         tree = html.fromstring(page.content())
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         data["DD Name"] = dd_label[0] if dd_label else "DD cannot be found"
         
         if dd_label:
-            # 抓取 Landing Page
+            # Landing Page
             raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
             if raw_link:
                 resp = wait_for_redirect_smart(page, raw_link[0])
                 data["Link works"] = get_link_status(page, resp)
                 data["Landing page URL"] = page.url
 
-            # 抓取 Cat1 - Cat4
+            # Categories (只抓前 4 個)
             for i in range(1, 5):
                 cat_key = f"Cat{i}"
-                if page.url != srp_url: page.goto(srp_url, wait_until="domcontentloaded")
+                # 如果不在 SRP 頁面才跳回去
+                if "yahoo.com" not in page.url:
+                    page.goto(srp_url, wait_until="domcontentloaded", timeout=20000)
+                
                 c_tree = html.fromstring(page.content())
                 c_name = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
                 c_link = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
@@ -102,27 +102,17 @@ def run_retailer_capture(page, row, column_order):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
     except Exception as e:
-        print(f"抓取 {retailer} 時出錯: {e}")
+        print(f"      ⚠️ {retailer} 抓取逾時，強制跳過")
     return data
 
-# --- 4. 主執行流程 ---
-
 def main():
-    print(f"🚀 啟動任務，使用硬編碼網址...")
-    
-    if not GSHEET_INPUT_URL or not GAS_OUTPUT_URL:
-        print("❌ 錯誤：網址未設定")
-        return
+    print("🚀 啟動優化版任務 (加速跳過 Ebay)...")
+    try:
+        df_input = pd.read_csv(GSHEET_INPUT_URL)
+    except Exception as e:
+        print(f"❌ 讀取來源失敗: {e}"); return
 
-    # 讀取資料
-    df_input = pd.read_csv(GSHEET_INPUT_URL)
-    column_order = [
-        "Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works", "Link Check",
-        "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works", "Cat1 Link Check",
-        "Cat2 Name", "Cat2 Link URL", "Cat2 page URL", "Cat2 Link works", "Cat2 Link Check",
-        "Cat3 Name", "Cat3 Link URL", "Cat3 page URL", "Cat3 Link works", "Cat3 Link Check",
-        "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works", "Cat4 Link Check"
-    ]
+    column_order = ["Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works", "Link Check", "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works", "Cat1 Link Check", "Cat2 Name", "Cat2 Link URL", "Cat2 page URL", "Cat2 Link works", "Cat2 Link Check", "Cat3 Name", "Cat3 Link URL", "Cat3 page URL", "Cat3 Link works", "Cat3 Link Check", "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works", "Cat4 Link Check"]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -133,18 +123,21 @@ def main():
             retailer_name = row['Retailer']
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             
-            # 執行抓取
+            # 開始抓取
             result_data = run_retailer_capture(page, row, column_order)
             
-            # 即時傳回 GAS
+            # 💡 關鍵：立即回傳！
             try:
-                requests.post(GAS_OUTPUT_URL, json=result_data, timeout=30)
-                print(f"✅ {retailer_name} 資料已成功回傳")
+                r = requests.post(GAS_OUTPUT_URL, json=result_data, timeout=20)
+                if r.status_code == 200:
+                    print(f"✅ {retailer_name} 資料已傳回 Sheet")
+                else:
+                    print(f"❌ {retailer_name} 傳回失敗，狀態碼: {r.status_code}")
             except Exception as e:
-                print(f"❌ {retailer_name} 回傳失敗: {e}")
+                print(f"❌ {retailer_name} 網路傳輸出錯")
 
         browser.close()
-    print("🎉 所有任務已完成！")
+    print("🎉 任務結束！")
 
 if __name__ == "__main__":
     main()
