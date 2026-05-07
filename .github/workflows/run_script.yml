@@ -1,14 +1,20 @@
 name: Run Retailer Tracker
 
+# 設定觸發條件
 on:
   push:
-    branches: [ main ]  # 當你上傳程式碼到 main 分支時執行
+    branches: [ main ]  # 當你推送程式碼到 main 分支時執行
   schedule:
-    - cron: '0 0 * * *' # 每天國際標準時間 00:00 自動執行 (可自行修改)
-  workflow_dispatch:    # 允許手動點擊按鈕執行
+    - cron: '0 0 * * *' # 每天國際標準時間 00:00 自動執行 (台灣時間早上 08:00)
+  workflow_dispatch:    # 允許在 Actions 頁面手動點擊按鈕執行
+
+# 解決 Node.js 20 棄用警告，強制使用 Node.js 24
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
+    # 使用最新的 Ubuntu 環境
     runs-on: ubuntu-latest
 
     steps:
@@ -23,11 +29,16 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        # 如果你沒有 requirements.txt，也可以直接在這裡安裝：
+        # pip install pandas playwright lxml requests
 
     - name: Install Playwright Browsers
       run: |
+        # 安裝 Chromium 瀏覽器及其系統相依套件
         python -m playwright install chromium --with-deps
 
     - name: Run Python script
-      run: python Cloud_track_url_v1.py
+      run: |
+        # 執行你的 Python 腳本
+        python Cloud_track_url_v1.py
