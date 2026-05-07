@@ -8,34 +8,37 @@ import json
 import os
 
 # --- 1. 配置設定 ---
-GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
+GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS-hMIOWp6V-9xdD5pQixZtUKwgTYyx37Bv1agLQb3CeOE6kNI0AD72lC_R1MurA8VNoLPa9C8sr4aa/pub?gid=1039583453&single=true&output=csv"
 GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
 
 # --- 2. 工具函式 ---
 
 def check_status_text(page):
-    """ 檢查頁面中是否含有錯誤關鍵字，若有回傳 '404'，否則回傳空值 """
+    """ 檢查是否為 404，否則回傳 '-' """
     try:
-        # 取得標題與內容並轉為小寫
+        # 等待一點時間確保頁面內容加載
+        page.wait_for_timeout(2000)
+        
+        # 排除瀏覽器內部錯誤網址
+        if "chromewebdata" in page.url or "chrome-error" in page.url:
+            return "Load Error"
+
         content = page.content().lower()
         title = page.title().lower()
         
         error_keywords = [
-            "page not found", 
-            "404", 
-            "dead end", 
-            "page cannot be found", 
-            "403"
+            "page not found", "404", "dead end", 
+            "page cannot be found", "403", "access denied"
         ]
         
         if any(kw in title for kw in error_keywords) or any(kw in content for kw in error_keywords):
             return "404"
-        return "" # 正常則顯示空值
+        return "-" # 正常則顯示 -
     except:
         return "Error"
 
 def is_intermediate_domain(url):
-    """ 判定是否為中間跳轉或無效網域 """
+    """ 判定是否為中間跳轉、黑名單或搜尋引擎頁面 """
     if not url: return True
     url_lower = url.lower()
     blacklist = [
@@ -43,17 +46,25 @@ def is_intermediate_domain(url):
         "affinity.net", "bizrate.com", "shophermedia.net", "provenpixel.com",
         "socialiqredir.com", "discounthero.org", "magik.ly", "netsourceio.com",
         "clickroll.net", "shopping123.com", "top-best.com", "v2i8b.com", 
-        "beyondcheap.com", "intentxredir.com", "peakoptions.site"
+        "beyondcheap.com", "intentxredir.com", "peakoptions.site",
+        "search.yahoo", "google.com/search"
     ]
     return any(k in url_lower for k in blacklist)
 
 def wait_for_redirect_smart(page, initial_url):
-    """ 智能等待跳轉直到脫離黑名單網域 """
+    """ 智能等待跳轉直到脫離 Yahoo 或中間頁面 """
     try:
-        page.goto(initial_url, wait_until="commit", timeout=60000)
-        for _ in range(8):
-            if not is_intermediate_domain(page.url): return True
-            page.wait_for_timeout(3000)
+        # 增加初始等待時間
+        page.goto(initial_url, wait_until="domcontentloaded", timeout=60000)
+        
+        # 最多循環檢查 15 次 (約 45-60 秒)，直到跳出黑名單
+        for _ in range(15):
+            current_url = page.url
+            if not is_intermediate_domain(current_url) and "chromewebdata" not in current_url:
+                # 脫離黑名單後，再多等一下確保官網加載完成
+                page.wait_for_load_state("networkidle", timeout=5000)
+                return True
+            time.sleep(3)
         return True
     except:
         return False
@@ -64,7 +75,6 @@ def run_retailer_capture(page, row, column_order):
     retailer = str(row.get('Retailer', 'N/A'))
     srp_url = str(row.get('SRP', ''))
     
-    # 初始化資料
     data = {col: "" for col in column_order}
     data.update({
         "Retailer": retailer, 
@@ -73,27 +83,28 @@ def run_retailer_capture(page, row, column_order):
     })
     
     try:
+        # 1. 讀取 SRP 搜尋頁面
         page.goto(srp_url, wait_until="load", timeout=60000)
-        time.sleep(2)
+        time.sleep(3)
         tree = html.fromstring(page.content())
         
-        # 抓取 DD Name
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         data["DD Name"] = dd_label[0] if dd_label else "DD cannot be found"
         
         if data["DD Name"] != "DD cannot be found":
-            # 1. Landing Page 處理
+            # --- 處理 Landing Page ---
             raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
             if raw_link:
                 wait_for_redirect_smart(page, raw_link[0])
                 data["Landing page URL"] = page.url
                 data["Link works"] = check_status_text(page)
             
-            # 2. 4 個 Categories 處理
+            # --- 處理 4 個 Categories ---
             for i in range(1, 5):
                 cat_key = f"Cat{i}"
-                if page.url != srp_url: 
-                    page.goto(srp_url, wait_until="domcontentloaded")
+                # 每次處理 Category 前回到 SRP 頁面
+                page.goto(srp_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(1)
                 
                 c_tree = html.fromstring(page.content())
                 c_name = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
@@ -104,9 +115,11 @@ def run_retailer_capture(page, row, column_order):
                 data[f"{cat_key} Link URL"] = link_val
                 
                 if link_val and link_val not in ["#", "N/A"]:
-                    wait_for_redirect_smart(page, link_val)
-                    data[f"{cat_key} page URL"] = page.url
-                    data[f"{cat_key} Link works"] = check_status_text(page)
+                    if wait_for_redirect_smart(page, link_val):
+                        data[f"{cat_key} page URL"] = page.url
+                        data[f"{cat_key} Link works"] = check_status_text(page)
+                    else:
+                        data[f"{cat_key} Link works"] = "Timeout"
 
     except Exception as e:
         print(f"⚠️ {retailer} 錯誤: {e}")
@@ -124,7 +137,6 @@ def upload_to_google(results_dict, gas_url):
 # --- 4. 主執行程序 ---
 
 def main():
-    # 已刪除所有 Check 相關欄位
     column_order = [
         "Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works",
         "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
@@ -143,9 +155,12 @@ def main():
     results_dict = {}
 
     with sync_playwright() as p:
+        # 使用更擬真的瀏覽器設定
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080},
+            locale="en-US"
         )
         page = context.new_page()
 
@@ -153,6 +168,8 @@ def main():
             retailer = row.get('Retailer', f'Row_{index}')
             print(f"🚀 處理中 ({index+1}/{len(df_input)}): {retailer}")
             results_dict[retailer] = run_retailer_capture(page, row, column_order)
+            # 每個商店處理完稍微停一下，降低被擋機率
+            time.sleep(2)
         
         print("📤 上傳結果...")
         upload_to_google(results_dict, GAS_OUTPUT_URL)
