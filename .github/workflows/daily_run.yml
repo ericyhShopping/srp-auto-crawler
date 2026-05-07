@@ -2,12 +2,15 @@ name: SRP Auto Crawler
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天午夜執行
-  workflow_dispatch:      # 允許手動執行
+    # 每天午夜 00:00 執行 (UTC 時間)
+    - cron: '0 0 * * *'
+  # 允許手動點擊按鈕執行
+  workflow_dispatch:
 
 jobs:
   run-crawler:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -24,9 +27,9 @@ jobs:
           playwright install chromium
 
       - name: Run Crawler Script
-        # 注意：env 必須與 name, run 對齊
+        # 注意：這裡的 ${{ }} 前面絕對沒有 $ 符號
         env:
           GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
           GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
-        # 使用 -u 確保 Print 訊息即時顯示
+        # 指向你正確的 Python 檔名，並加上 -u 讓 Log 即時輸出
         run: python -u Cloud_track_url_v1.py
