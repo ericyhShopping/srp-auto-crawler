@@ -28,4 +28,4 @@ jobs:
         env:
           GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
           GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
-        run: python main.py  # 請確保這裡的檔名跟你的 .py 檔名一樣
+        run: python Cloud_track_url_v1.py  # 請確保這裡的檔名跟你的 .py 檔名一樣
