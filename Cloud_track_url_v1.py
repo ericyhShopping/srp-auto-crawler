@@ -38,7 +38,7 @@ def is_intermediate_domain(url):
     url_lower = url.lower()
     blacklist = [
         "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
-        "chrome-error://", "chromewebdata", "access-denied",
+        "chrome-error://", "chromewebdata", "access-denied", "accessdenied",
         "affinity.net", "bizrate.com", "ebay.com/rover", "rover.ebay.com", "peakoptions.site", "clickroll.net"
     ]
     return any(k in url_lower for k in blacklist)
@@ -47,8 +47,8 @@ def get_link_status(page, response):
     try:
         curr_url = page.url
         if is_intermediate_domain(curr_url): return "Error"
-        # 針對難抓網站，只要能進去就給 Yes
-        if any(k in curr_url for k in ["ebay.com", "hotels.com", "jcpenney.com", "lowes.com", "rei.com", "zappos.com"]): 
+        # 針對難抓網站，只要能跳轉成功就給 Yes
+        if any(k in curr_url for k in ["ebay.com", "hotels.com", "jcpenney.com", "lowes.com", "rei.com", "zappos.com", "robinhood.com", "lifelock.com"]): 
             return "Yes"
         if not response: return "No"
         status = response.status
@@ -58,13 +58,16 @@ def get_link_status(page, response):
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
     try:
-        timeout = 35000 if any(k in retailer_name for k in ["Hotels", "JCPenney", "Lowe", "REI", "Zappos", "Ebay"]) else 25000
+        # 針對極高難度網站，進一步放寬等待時間
+        hard_list = ["Hotels.com", "JCPenney", "Lowe's", "REI", "Zappos", "Robinhood", "LifeLock"]
+        timeout = 40000 if any(k in retailer_name for k in hard_list) else 25000
+        
         resp = page.goto(initial_url, wait_until="commit", timeout=timeout)
         
-        # 模擬人類微小動作
-        page.mouse.wheel(0, 200)
+        # 💡 行為模擬：隨機滑鼠捲動，欺騙偵測器
+        page.mouse.wheel(0, random.randint(300, 600))
         
-        for _ in range(7): 
+        for _ in range(8): 
             curr_url = page.url
             if "ebay.com" in curr_url and "rover" not in curr_url: return resp
             if not is_intermediate_domain(curr_url): return resp
@@ -85,10 +88,9 @@ def run_retailer_capture(page, row, column_order):
         time.sleep(3) 
         tree = html.fromstring(page.content())
         
-        # 抓取 DD Name
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         
-        # 💡 修正：針對 Nordstrom 找不到 DD 的處理
+        # Nordstrom 找不到 DD 的特殊處理
         if not dd_label:
             if "Nordstrom" in retailer:
                 data["DD Name"] = "DD cannot be found"
@@ -102,7 +104,6 @@ def run_retailer_capture(page, row, column_order):
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
-        # 抓取連結資訊
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         cat_links = []
         for i in range(1, 5):
@@ -110,23 +111,35 @@ def run_retailer_capture(page, row, column_order):
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
             cat_links.append({"name": c_name[0] if c_name else "N/A", "link": c_link[0] if c_link else None})
 
+        # 處理 Landing Page
+        last_captured_url = ""
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
-            if not is_intermediate_domain(page.url):
+            curr_url = page.url
+            if not is_intermediate_domain(curr_url):
                 data["Link works"] = get_link_status(page, resp)
-                data["Landing page URL"] = page.url
+                data["Landing page URL"] = curr_url
+                last_captured_url = curr_url
 
+        # 處理 Cat 1-4
         for i, cat in enumerate(cat_links):
             cat_key = f"Cat{i+1}"
             data[f"{cat_key} Name"] = cat["name"]
             if cat["link"]:
                 data[f"{cat_key} Link URL"] = cat["link"]
                 c_resp = wait_for_redirect_smart(page, cat["link"], retailer)
-                if not is_intermediate_domain(page.url):
-                    data[f"{cat_key} page URL"] = page.url
+                curr_actual_url = page.url
+                # 💡 修正重複問題：檢查 URL 是否與前一個不同
+                if not is_intermediate_domain(curr_actual_url) and curr_actual_url != last_captured_url:
+                    data[f"{cat_key} page URL"] = curr_actual_url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
+                    last_captured_url = curr_actual_url
+                else:
+                    data[f"{cat_key} page URL"] = ""
+                    data[f"{cat_key} Link works"] = "Error"
+            else:
+                data[f"{cat_key} Link URL"] = "N/A"
 
-        # 判定：如果 Landing Page URL 還是空的或在黑名單，代表沒抓到
         if not data["Landing page URL"] or is_intermediate_domain(data["Landing page URL"]):
             return None
 
@@ -137,14 +150,15 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動任務：Nordstrom 修正與防攔截強化版")
+    print("🚀 啟動強化任務：七大難關挑戰與重複 URL 校正版")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
 
     existing_records = {}
     try:
-        fresh_url = f"{TRACK_URL_DATA_CSV}&t={int(time.time())}"
+        cache_breaker = random.randint(1000, 9999)
+        fresh_url = f"{TRACK_URL_DATA_CSV}&t={int(time.time())}&cb={cache_breaker}"
         df_existing = pd.read_csv(fresh_url)
         for _, r in df_existing[::-1].iterrows():
             name = str(r['Retailer']).strip()
@@ -165,7 +179,13 @@ def main():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="en-US", timezone_id="America/New_York",
             viewport={"width": 1920, "height": 1080},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Upgrade-Insecure-Requests": "1"
+            }
         )
         page = context.new_page()
         if stealth_sync: stealth_sync(page)
@@ -176,36 +196,43 @@ def main():
             retailer_name = str(row['Retailer']).strip()
             srp_url = str(row.get('SRP', ''))
             
-            # --- Skip 邏輯 (保持原有 7 天規範) ---
             should_crawl = True
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                old_dd = str(old.get('DD Name', '')).strip().lower()
-                old_date_str = str(old.get('Update Date', ''))
-                within_7_days = False
-                try:
-                    old_date = datetime.strptime(old_date_str.replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                    if now - old_date < timedelta(days=7): within_7_days = True
-                except: pass
-                if (old_dd == "dd cannot be found" and within_7_days) or \
-                   (old_dd != "" and within_7_days and is_data_complete(old)):
-                    print(f"⏭️  Skip: {retailer_name}")
-                    should_crawl = False
+                old_dd = str(old.get('DD Name', '')).strip()
+                if old_dd.lower() == 'nan': old_dd = ""
+                old_date_str = str(old.get('Update Date', '')).strip()
+                if old_date_str.lower() == 'nan': old_date_str = ""
+                
+                if not old_dd:
+                    should_crawl = True
+                else:
+                    within_7_days = False
+                    try:
+                        old_date = datetime.strptime(old_date_str.replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                        if now - old_date < timedelta(days=7): within_7_days = True
+                    except: pass
+                    
+                    if old_dd.lower() == "dd cannot be found" and within_7_days:
+                        print(f"⏭️  Skip: {retailer_name}")
+                        should_crawl = False
+                    elif old_dd != "" and within_7_days and is_data_complete(old):
+                        print(f"⏭️  Skip: {retailer_name}")
+                        should_crawl = False
 
             if not should_crawl: continue
 
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
-            # --- 寫入邏輯 ---
             if result and (str(result.get("DD Name")).lower() == "dd cannot be found" or is_data_complete(result)):
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 更新成功")
+                    print(f"   ✅ {retailer_name} 覆蓋更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                # 抓取失敗或被攔截，僅保留 Retailer/SRP
-                print(f"   ⚠️ {retailer_name} 抓取受阻，重置資料...")
+                # 💡 當抓取受阻（如 Hotels.com 擋 IP）時，確保只保留名稱和 SRP
+                print(f"   ⚠️ {retailer_name} 抓取受阻，重置該列資料...")
                 fail_payload = {col: "" for col in column_order}
                 fail_payload["Retailer"] = retailer_name
                 fail_payload["SRP"] = srp_url
@@ -213,7 +240,8 @@ def main():
                     requests.post(GAS_OUTPUT_URL, json=fail_payload, timeout=25)
                 except: pass
             
-            time.sleep(random.uniform(4, 7))
+            # 💡 增加隨機休眠，模仿人類瀏覽節奏
+            time.sleep(random.uniform(5, 8))
 
         browser.close()
     print("🎉 任務完成！")
