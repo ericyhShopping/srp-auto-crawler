@@ -1,6 +1,11 @@
 import time
 import pandas as pd
 from playwright.sync_api import sync_playwright
+try:
+    from playwright_stealth import stealth_sync
+except ImportError:
+    stealth_sync = None
+
 from lxml import html
 from datetime import datetime, timezone, timedelta
 import requests
@@ -29,12 +34,11 @@ def is_data_complete(row_data):
     return True
 
 def is_intermediate_domain(url):
-    """ 強化版黑名單：過濾無效的錯誤頁面與搜尋頁面 """
     if not url: return True
     url_lower = url.lower()
     blacklist = [
         "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
-        "chrome-error://", "chromewebdata", # 💡 新增：過濾瀏覽器錯誤頁面
+        "chrome-error://", "chromewebdata",
         "affinity.net", "bizrate.com", "ebay.com/rover", "rover.ebay.com", "peakoptions.site", "clickroll.net"
     ]
     return any(k in url_lower for k in blacklist)
@@ -42,9 +46,10 @@ def is_intermediate_domain(url):
 def get_link_status(page, response):
     try:
         current_url = page.url
-        # 如果最後停在黑名單頁面，直接報錯
         if is_intermediate_domain(current_url): return "Error"
-        if "ebay.com" in current_url: return "Yes"
+        # 針對特定品牌放寬判定
+        if any(k in current_url for k in ["ebay.com", "hotels.com", "jcpenney.com"]): return "Yes"
+        
         if not response: return "No"
         status = response.status
         page_title = page.title().lower()
@@ -52,15 +57,23 @@ def get_link_status(page, response):
         return "Yes" if 200 <= status < 300 else "No"
     except: return "No"
 
-def wait_for_redirect_smart(page, initial_url):
+def wait_for_redirect_smart(page, initial_url, retailer_name):
+    """ 針對不同品牌優化等待策略 """
     try:
-        resp = page.goto(initial_url, wait_until="commit", timeout=20000)
-        for _ in range(5): 
+        # 增加超時時間給高難度網站
+        timeout = 35000 if retailer_name in ["Hotels.com", "JCPenney", "Lowe's", "REI"] else 25000
+        resp = page.goto(initial_url, wait_until="commit", timeout=timeout)
+        
+        # 💡 模擬行為：微幅滾動，這能突破某些反爬偵測
+        page.mouse.wheel(0, 300)
+        
+        for _ in range(6): 
             curr_url = page.url
+            # 針對 Ebay 快速回傳
             if "ebay.com" in curr_url and "rover" not in curr_url: return resp
-            # 只有當 URL 不在黑名單內，才視為成功跳轉
+            # 成功跳出 Yahoo
             if not is_intermediate_domain(curr_url): return resp
-            page.wait_for_timeout(1500) 
+            page.wait_for_timeout(2000) 
         return resp
     except: return None
 
@@ -94,8 +107,7 @@ def run_retailer_capture(page, row, column_order):
 
         # 處理 Landing Page
         if landing_raw:
-            resp = wait_for_redirect_smart(page, landing_raw[0])
-            # 檢查是否停留在無效網址
+            resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
             if not is_intermediate_domain(page.url):
                 data["Link works"] = get_link_status(page, resp)
                 data["Landing page URL"] = page.url
@@ -106,18 +118,14 @@ def run_retailer_capture(page, row, column_order):
             data[f"{cat_key} Name"] = cat["name"]
             if cat["link"]:
                 data[f"{cat_key} Link URL"] = cat["link"]
-                c_resp = wait_for_redirect_smart(page, cat["link"])
-                # 只有非無效網域才寫入
+                c_resp = wait_for_redirect_smart(page, cat["link"], retailer)
                 if not is_intermediate_domain(page.url):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
-                else:
-                    data[f"{cat_key} page URL"] = ""
-                    data[f"{cat_key} Link works"] = "Error"
             else:
                 data[f"{cat_key} Link URL"] = "N/A"
 
-        # 嚴格判定：如果 Landing Page 是無效網址，不壓日期
+        # 判定：Landing Page 必須有效
         if not data["Landing page URL"] or is_intermediate_domain(data["Landing page URL"]):
             return None
 
@@ -128,7 +136,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動任務：過濾 chrome-error 與 Yahoo 殘留版")
+    print("🚀 啟動強化隱身版任務...")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -152,9 +160,24 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="en-US", timezone_id="America/New_York")
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # 💡 高度偽裝 Context
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
+            viewport={"width": 1920, "height": 1080},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"'
+            }
+        )
+        
         page = context.new_page()
+        # 💡 啟用 Stealth
+        if stealth_sync: stealth_sync(page)
+
         now = datetime.now(timezone.utc)
 
         for index, row in df_input.iterrows():
@@ -182,14 +205,13 @@ def main():
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
-            # --- 💡 失敗補償邏輯 ---
             if result and (str(result.get("DD Name")).lower() == "dd cannot be found" or is_data_complete(result)):
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 完整更新成功")
+                    print(f"   ✅ {retailer_name} 覆蓋更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                print(f"   ⚠️ {retailer_name} 抓取不全（包含錯誤頁面），僅重置名稱與 SRP...")
+                print(f"   ⚠️ {retailer_name} 抓取不齊全，重置該列資料...")
                 fail_payload = {col: "" for col in column_order}
                 fail_payload["Retailer"] = retailer_name
                 fail_payload["SRP"] = srp_url
@@ -197,10 +219,10 @@ def main():
                     requests.post(GAS_OUTPUT_URL, json=fail_payload, timeout=25)
                 except: pass
             
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(4, 7)) # 增加隨機休眠時間降低封鎖機率
 
         browser.close()
-    print("🎉 任務完成！")
+    print("🎉 任務結束！")
 
 if __name__ == "__main__":
     main()
