@@ -8,7 +8,7 @@ import json
 import os
 
 # --- 1. 配置設定 ---
-GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS-hMIOWp6V-9xdD5pQixZtUKwgTYyx37Bv1agLQb3CeOE6kNI0AD72lC_R1MurA8VNoLPa9C8sr4aa/pub?gid=1039583453&single=true&output=csv"
+GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
 GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
 
 # --- 2. 工具函式 ---
