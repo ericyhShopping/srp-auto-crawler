@@ -1,4 +1,5 @@
-pandas
 playwright
-lxml
+playwright-stealth
+pandas
 requests
+lxml
