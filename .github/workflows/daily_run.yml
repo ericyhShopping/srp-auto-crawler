@@ -1,28 +1,31 @@
-name: Daily SRP Update Job
+name: SRP Auto Crawler
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 每天 UTC 01:00 (台灣時間早上 9:00) 自動執行
-  workflow_dispatch:      # 允許你在 GitHub 介面手動點擊按鈕執行測試
+    - cron: '0 0 * * *'  # 每天午夜執行
+  workflow_dispatch:      # 允許手動執行
 
 jobs:
-  scrape-and-update:
+  run-crawler:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
-          pip install playwright pandas lxml openai requests
+          python -m pip install --upgrade pip
+          pip install playwright pandas lxml requests
           playwright install chromium
 
-      - name: Run Script
+      - name: Run Crawler Script
+        # --- 這裡就是將 Secrets 餵給 Python 的地方 ---
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python cloud_track_v26.py
+          GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
+          GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
+        run: python main.py  # 請確保這裡的檔名跟你的 .py 檔名一樣
