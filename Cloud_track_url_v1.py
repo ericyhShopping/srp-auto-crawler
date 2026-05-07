@@ -9,8 +9,11 @@ import requests
 
 # --- 1. 環境變數讀取 ---
 # 這裡會讀取 YAML 中 env 區塊定義的變數
-GSHEET_INPUT_URL = os.environ.get('GSHEET_INPUT_URL')
-GAS_OUTPUT_URL = os.environ.get('GAS_OUTPUT_URL')
+GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
+GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
+
+def main():
+    print(f"DEBUG: 正在使用硬編碼網址執行...")
 
 def is_intermediate_domain(url):
     """ 判定是否為中間轉址網域。 """
