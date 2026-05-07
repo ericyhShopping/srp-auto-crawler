@@ -5,10 +5,13 @@ from lxml import html
 from datetime import datetime, timezone, timedelta
 import requests
 import json
+import random
 
 # --- 1. 設定區域 ---
+# 來源名單
 GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
-GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyLvET6p-l_zxQaoJqk-XLg6PEd--bBu__lqqRcc_LF70cgHmijRRpXSr2Kf50NHlLoiA/exec"
+# 你最新的 GAS API (支援覆蓋模式)
+GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbwfA2vP2hdACwsEei73OSQUEojmXFRyyKqu_NcsDFi0Mp7oU2_fTUB1DCM2x4oFMWt7tA/exec"
 # 讀取用的 track_url CSV 連結
 TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=0&single=true&output=csv"
 
@@ -76,23 +79,20 @@ def run_retailer_capture(page, row, column_order):
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         
         if not dd_label:
-            return None # 連 DD 都沒抓到，不回傳，不壓日期
+            return None 
 
         data["DD Name"] = dd_label[0]
         
-        # 如果是 DD cannot be found，這是確定的結果，直接壓日期回傳
         if data["DD Name"].lower() == "dd cannot be found":
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
-        # 抓取 Landing Page
         raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if raw_link:
             resp = wait_for_redirect_smart(page, raw_link[0])
             data["Link works"] = get_link_status(page, resp)
             data["Landing page URL"] = page.url
 
-        # 抓取 Categories 1-4
         for i in range(1, 5):
             cat_key = f"Cat{i}"
             if "yahoo.com" not in page.url: page.goto(srp_url, wait_until="domcontentloaded", timeout=20000)
@@ -107,11 +107,9 @@ def run_retailer_capture(page, row, column_order):
                 data[f"{cat_key} page URL"] = page.url
                 data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
 
-        # 檢查關鍵資料是否成功抓取
         if not data["Landing page URL"] or data["Landing page URL"] == "":
-            return None # 抓取不完整，不壓日期
+            return None 
 
-        # 全部成功才壓日期
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
 
@@ -121,19 +119,25 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動優化任務：品質門檻監控版")
+    print("🚀 任務啟動：覆蓋模式 + 破解快取比對中...")
+    
+    # 讀取 Input
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
-    except: print("❌ 無法讀取來源名單"); return
+    except: print("❌ 無法讀取 Input CSV"); return
 
+    # 讀取歷史紀錄 (加入隨機參數破解 Google CSV 快取)
     existing_records = {}
     try:
-        df_existing = pd.read_csv(TRACK_URL_DATA_CSV)
+        fresh_url = f"{TRACK_URL_DATA_CSV}&t={int(time.time())}"
+        df_existing = pd.read_csv(fresh_url)
+        # 反轉讀取，確保保留的是最新的一筆記錄
         for _, r in df_existing[::-1].iterrows():
-            name = str(r['Retailer'])
+            name = str(r['Retailer']).strip()
             if name not in existing_records:
                 existing_records[name] = r.to_dict()
-    except: print("⚠️ 無舊資料。")
+        print(f"📊 成功加載歷史紀錄，共 {len(existing_records)} 筆零售商。")
+    except: print("⚠️ 無歷史紀錄，將視為全新品項。")
 
     column_order = [
         "Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works",
@@ -147,23 +151,22 @@ def main():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="en-US", 
-            timezone_id="America/New_York"
+            locale="en-US", timezone_id="America/New_York"
         )
         page = context.new_page()
         now = datetime.now(timezone.utc)
 
         for index, row in df_input.iterrows():
-            retailer_name = str(row['Retailer'])
+            retailer_name = str(row['Retailer']).strip()
             should_crawl = True
             
+            # --- 比對邏輯 ---
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
                 old_dd = str(old.get('DD Name', '')).strip()
                 old_date_str = str(old.get('Update Date', ''))
                 
-                # 判斷是否為有效記錄
-                # 條件：必須標註為 DD cannot be found (確認過找不到)
+                # 只有標記為 "DD cannot be found" 才視為已經驗證過找不到
                 has_been_verified = (old_dd.lower() == "dd cannot be found")
                 
                 within_7_days = False
@@ -177,10 +180,13 @@ def main():
                 
                 complete = is_data_complete(old)
                 
-                # 同時滿足：已確認無DD、且在7天內、且欄位全滿，才 Skip
+                # 同時滿足：已確認無DD、且在7天內、且資料全滿，才 Skip
                 if has_been_verified and within_7_days and complete:
                     print(f"⏭️  Skip: {retailer_name}")
                     should_crawl = False
+                else:
+                    # 如果有資料但不符合以上，我們也要重新跑以取代舊資料
+                    pass
 
             if not should_crawl: continue
 
@@ -189,14 +195,15 @@ def main():
             
             if result:
                 try:
-                    requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 回傳成功")
+                    # 使用 json.dumps 確保格式正確
+                    requests.post(GAS_OUTPUT_URL, data=json.dumps(result), headers={'Content-Type': 'application/json'}, timeout=25)
+                    print(f"   ✅ {retailer_name} 覆蓋更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                print(f"   ⚠️ {retailer_name} 資料不全，跳過壓日期")
+                print(f"   ⚠️ {retailer_name} 抓取不全，不執行更新")
 
         browser.close()
-    print("🎉 任務結束！")
+    print("🎉 任務全部結束！")
 
 if __name__ == "__main__":
     main()
