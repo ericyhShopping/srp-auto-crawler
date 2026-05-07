@@ -47,7 +47,7 @@ def get_link_status(page, response):
     try:
         curr_url = page.url
         if is_intermediate_domain(curr_url): return "Error"
-        # 針對難抓網站，只要能跳轉成功就給 Yes
+        # 針對難抓網站，只要能進去就給 Yes
         if any(k in curr_url for k in ["ebay.com", "hotels.com", "jcpenney.com", "lowes.com", "rei.com", "zappos.com", "robinhood.com", "lifelock.com"]): 
             return "Yes"
         if not response: return "No"
@@ -58,15 +58,10 @@ def get_link_status(page, response):
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
     try:
-        # 針對極高難度網站，進一步放寬等待時間
         hard_list = ["Hotels.com", "JCPenney", "Lowe's", "REI", "Zappos", "Robinhood", "LifeLock"]
         timeout = 40000 if any(k in retailer_name for k in hard_list) else 25000
-        
         resp = page.goto(initial_url, wait_until="commit", timeout=timeout)
-        
-        # 💡 行為模擬：隨機滑鼠捲動，欺騙偵測器
         page.mouse.wheel(0, random.randint(300, 600))
-        
         for _ in range(8): 
             curr_url = page.url
             if "ebay.com" in curr_url and "rover" not in curr_url: return resp
@@ -83,6 +78,9 @@ def run_retailer_capture(page, row, column_order):
     data = {col: "" for col in column_order}
     data["Retailer"], data["SRP"] = retailer, srp_url
     
+    # 💡 預期找不到 DD 的清單
+    expected_no_dd = ["LifeLock", "REI", "Nordstrom", "Nordstrom Rack"]
+    
     try:
         page.goto(srp_url, wait_until="domcontentloaded", timeout=35000)
         time.sleep(3) 
@@ -90,13 +88,13 @@ def run_retailer_capture(page, row, column_order):
         
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         
-        # Nordstrom 找不到 DD 的特殊處理
+        # 💡 處理找不到 DD 的情況
         if not dd_label:
-            if "Nordstrom" in retailer:
+            if any(k in retailer for k in expected_no_dd):
                 data["DD Name"] = "DD cannot be found"
                 data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
                 return data
-            return None
+            return None # 非預期無 DD 網站，回傳 None 以便觸發「保留舊資料」邏輯
             
         data["DD Name"] = dd_label[0]
 
@@ -129,7 +127,7 @@ def run_retailer_capture(page, row, column_order):
                 data[f"{cat_key} Link URL"] = cat["link"]
                 c_resp = wait_for_redirect_smart(page, cat["link"], retailer)
                 curr_actual_url = page.url
-                # 💡 修正重複問題：檢查 URL 是否與前一個不同
+                # 💡 防止 URL 重複
                 if not is_intermediate_domain(curr_actual_url) and curr_actual_url != last_captured_url:
                     data[f"{cat_key} page URL"] = curr_actual_url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
@@ -150,7 +148,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動強化任務：七大難關挑戰與重複 URL 校正版")
+    print("🚀 啟動強化任務：資料保護與強制 NF 標記版")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -225,22 +223,16 @@ def main():
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
+            # 💡 判斷是否要發送寫入請求
             if result and (str(result.get("DD Name")).lower() == "dd cannot be found" or is_data_complete(result)):
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
                     print(f"   ✅ {retailer_name} 覆蓋更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                # 💡 當抓取受阻（如 Hotels.com 擋 IP）時，確保只保留名稱和 SRP
-                print(f"   ⚠️ {retailer_name} 抓取受阻，重置該列資料...")
-                fail_payload = {col: "" for col in column_order}
-                fail_payload["Retailer"] = retailer_name
-                fail_payload["SRP"] = srp_url
-                try:
-                    requests.post(GAS_OUTPUT_URL, json=fail_payload, timeout=25)
-                except: pass
+                # 💡 資料失敗時，不發送任何 Post 請求給 GAS，保留原有試算表內容
+                print(f"   ⚠️ {retailer_name} 抓取受阻，保留舊資料不變。")
             
-            # 💡 增加隨機休眠，模仿人類瀏覽節奏
             time.sleep(random.uniform(5, 8))
 
         browser.close()
