@@ -28,8 +28,4 @@ jobs:
 
       - name: Run Crawler Script
         # 注意：這裡的 ${{ }} 前面絕對沒有 $ 符號
-        env:
-          GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
-          GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
-        # 指向你正確的 Python 檔名，並加上 -u 讓 Log 即時輸出
         run: python -u Cloud_track_url_v1.py
