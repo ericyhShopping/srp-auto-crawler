@@ -7,13 +7,11 @@ from datetime import datetime, timezone
 import os
 import requests
 
-# --- 1. 環境變數讀取 ---
-# 這裡會讀取 YAML 中 env 區塊定義的變數
+# --- 1. 設定區域 ---
 GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
 GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
 
-def main():
-    print(f"DEBUG: 正在使用硬編碼網址執行...")
+# --- 2. 工具函式 ---
 
 def is_intermediate_domain(url):
     """ 判定是否為中間轉址網域。 """
@@ -29,7 +27,7 @@ def is_intermediate_domain(url):
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
-    """ 核心判定邏輯：包含 404 關鍵字檢查。 """
+    """ 判定 404 關鍵字與連結效力。 """
     try:
         current_url = page.url
         if is_intermediate_domain(current_url): return "Error"
@@ -51,24 +49,69 @@ def get_link_status(page, response):
         return "No"
 
 def wait_for_redirect_smart(page, initial_url):
-    """ 強制追蹤轉址，直到脫離 Yahoo/中間網域。 """
+    """ 追蹤轉址直到脫離 Yahoo。 """
     try:
         resp = page.goto(initial_url, wait_until="commit", timeout=60000)
         for _ in range(12): 
             if not is_intermediate_domain(page.url):
                 page.wait_for_timeout(2000)
                 return resp
-            print(f"      ...等待跳轉中 (目前: {page.url[:50]}...)")
             page.mouse.move(random.randint(100, 300), random.randint(100, 300))
             page.wait_for_timeout(4000)
         return resp
     except:
         return None
 
+# --- 3. 核心抓取函式 (這部分你原本漏掉了) ---
+
+def run_retailer_capture(page, row, column_order):
+    retailer = str(row.get('Retailer', 'N/A'))
+    srp_url = str(row.get('SRP', ''))
+    data = {col: ("N/A" if "Check" in col else "") for col in column_order}
+    data["Retailer"], data["SRP"] = retailer, srp_url
+    data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    try:
+        page.goto(srp_url, wait_until="load", timeout=60000)
+        time.sleep(3)
+        tree = html.fromstring(page.content())
+        dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
+        data["DD Name"] = dd_label[0] if dd_label else "DD cannot be found"
+        
+        if dd_label:
+            # 抓取 Landing Page
+            raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
+            if raw_link:
+                resp = wait_for_redirect_smart(page, raw_link[0])
+                data["Link works"] = get_link_status(page, resp)
+                data["Landing page URL"] = page.url
+
+            # 抓取 Cat1 - Cat4
+            for i in range(1, 5):
+                cat_key = f"Cat{i}"
+                if page.url != srp_url: page.goto(srp_url, wait_until="domcontentloaded")
+                c_tree = html.fromstring(page.content())
+                c_name = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
+                c_link = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
+                
+                data[f"{cat_key} Name"] = c_name[0] if c_name else "N/A"
+                if c_link:
+                    l_val = c_link[0]
+                    data[f"{cat_key} Link URL"] = l_val
+                    c_resp = wait_for_redirect_smart(page, l_val)
+                    data[f"{cat_key} page URL"] = page.url
+                    data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
+    except Exception as e:
+        print(f"抓取 {retailer} 時出錯: {e}")
+    return data
+
+# --- 4. 主執行流程 ---
+
 def main():
-    # 檢查變數是否成功讀取
+    print(f"🚀 啟動任務，使用硬編碼網址...")
+    
     if not GSHEET_INPUT_URL or not GAS_OUTPUT_URL:
-        print("❌ 錯誤：找不到 GSHEET_INPUT_URL 或 GAS_OUTPUT_URL 變數")
+        print("❌ 錯誤：網址未設定")
         return
 
     # 讀取資料
@@ -87,12 +130,18 @@ def main():
         page = context.new_page()
 
         for index, row in df_input.iterrows():
-            print(f"🚀 Processing: {row['Retailer']}")
-            # 這裡執行原本的抓取邏輯 (run_retailer_capture)
-            # ... (抓取邏輯代碼) ...
+            retailer_name = row['Retailer']
+            print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             
-            # 回傳 GAS
-            # requests.post(GAS_OUTPUT_URL, json=result_data)
+            # 執行抓取
+            result_data = run_retailer_capture(page, row, column_order)
+            
+            # 即時傳回 GAS
+            try:
+                requests.post(GAS_OUTPUT_URL, json=result_data, timeout=30)
+                print(f"✅ {retailer_name} 資料已成功回傳")
+            except Exception as e:
+                print(f"❌ {retailer_name} 回傳失敗: {e}")
 
         browser.close()
     print("🎉 所有任務已完成！")
