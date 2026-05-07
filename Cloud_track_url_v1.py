@@ -9,12 +9,13 @@ import json
 # --- 1. 設定區域 ---
 GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
 GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyLvET6p-l_zxQaoJqk-XLg6PEd--bBu__lqqRcc_LF70cgHmijRRpXSr2Kf50NHlLoiA/exec"
+# 讀取用的 track_url CSV 連結
 TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=0&single=true&output=csv"
 
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 檢查 Landing page 與 Cat1-4 相關 18 個欄位 """
+    """ 檢查 18 個關鍵欄位是否都有實質內容 """
     fields_to_check = [
         "Landing page URL", "Link works",
         "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
@@ -24,7 +25,7 @@ def is_data_complete(row_data):
     ]
     for field in fields_to_check:
         val = str(row_data.get(field, "")).strip().lower()
-        if val in ["", "nan", "undefined", "none", "null"]:
+        if val in ["", "nan", "undefined", "none", "null", "n/a"]:
             return False
     return True
 
@@ -67,41 +68,60 @@ def run_retailer_capture(page, row, column_order):
     srp_url = str(row.get('SRP', ''))
     data = {col: "" for col in column_order}
     data["Retailer"], data["SRP"] = retailer, srp_url
-    data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    
     try:
         page.goto(srp_url, wait_until="load", timeout=30000)
         time.sleep(2)
         tree = html.fromstring(page.content())
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
-        data["DD Name"] = dd_label[0] if dd_label else "DD cannot be found"
         
-        # 即使抓到 DD cannot be found，我們還是要把結果傳回去紀錄
-        if dd_label and data["DD Name"].lower() != "dd cannot be found":
-            raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
-            if raw_link:
-                resp = wait_for_redirect_smart(page, raw_link[0])
-                data["Link works"] = get_link_status(page, resp)
-                data["Landing page URL"] = page.url
-            for i in range(1, 5):
-                cat_key = f"Cat{i}"
-                if "yahoo.com" not in page.url: page.goto(srp_url, wait_until="domcontentloaded", timeout=20000)
-                c_tree = html.fromstring(page.content())
-                c_name = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
-                c_link = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
-                data[f"{cat_key} Name"] = c_name[0] if c_name else "N/A"
-                if c_link:
-                    l_val = c_link[0]
-                    data[f"{cat_key} Link URL"] = l_val
-                    c_resp = wait_for_redirect_smart(page, l_val)
-                    data[f"{cat_key} page URL"] = page.url
-                    data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
-    except: pass
-    return data
+        if not dd_label:
+            return None # 連 DD 都沒抓到，不回傳，不壓日期
+
+        data["DD Name"] = dd_label[0]
+        
+        # 如果是 DD cannot be found，這是確定的結果，直接壓日期回傳
+        if data["DD Name"].lower() == "dd cannot be found":
+            data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            return data
+
+        # 抓取 Landing Page
+        raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
+        if raw_link:
+            resp = wait_for_redirect_smart(page, raw_link[0])
+            data["Link works"] = get_link_status(page, resp)
+            data["Landing page URL"] = page.url
+
+        # 抓取 Categories 1-4
+        for i in range(1, 5):
+            cat_key = f"Cat{i}"
+            if "yahoo.com" not in page.url: page.goto(srp_url, wait_until="domcontentloaded", timeout=20000)
+            c_tree = html.fromstring(page.content())
+            c_name = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
+            c_link = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
+            data[f"{cat_key} Name"] = c_name[0] if c_name else "N/A"
+            if c_link:
+                l_val = c_link[0]
+                data[f"{cat_key} Link URL"] = l_val
+                c_resp = wait_for_redirect_smart(page, l_val)
+                data[f"{cat_key} page URL"] = page.url
+                data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
+
+        # 檢查關鍵資料是否成功抓取
+        if not data["Landing page URL"] or data["Landing page URL"] == "":
+            return None # 抓取不完整，不壓日期
+
+        # 全部成功才壓日期
+        data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        return data
+
+    except:
+        return None
 
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動任務：執行 DD Name 存在性與完整性檢查...")
+    print("🚀 啟動優化任務：品質門檻監控版")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: print("❌ 無法讀取來源名單"); return
@@ -113,7 +133,7 @@ def main():
             name = str(r['Retailer'])
             if name not in existing_records:
                 existing_records[name] = r.to_dict()
-    except: print("⚠️ 無舊資料，全面啟動爬取。")
+    except: print("⚠️ 無舊資料。")
 
     column_order = [
         "Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works",
@@ -125,7 +145,11 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="en-US", timezone_id="America/New_York")
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="en-US", 
+            timezone_id="America/New_York"
+        )
         page = context.new_page()
         now = datetime.now(timezone.utc)
 
@@ -138,9 +162,8 @@ def main():
                 old_dd = str(old.get('DD Name', '')).strip()
                 old_date_str = str(old.get('Update Date', ''))
                 
-                # --- 修正後的邏輯 ---
-                # 只有 DD Name 正確標示為 "DD cannot be found" 時，才算「檢查過」
-                # 如果它是空的、nan，則觸發爬蟲 (should_crawl 保持 True)
+                # 判斷是否為有效記錄
+                # 條件：必須標註為 DD cannot be found (確認過找不到)
                 has_been_verified = (old_dd.lower() == "dd cannot be found")
                 
                 within_7_days = False
@@ -154,9 +177,9 @@ def main():
                 
                 complete = is_data_complete(old)
                 
-                # 滿足所有條件才 Skip：已確認找不到 DD、且在 7 天內、且資料架構完整
+                # 同時滿足：已確認無DD、且在7天內、且欄位全滿，才 Skip
                 if has_been_verified and within_7_days and complete:
-                    print(f"⏭️  Skip: {retailer_name} (已確認無 DD 且在 7 天內)")
+                    print(f"⏭️  Skip: {retailer_name}")
                     should_crawl = False
 
             if not should_crawl: continue
@@ -164,10 +187,13 @@ def main():
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
-            try:
-                requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                print(f"   ✅ {retailer_name} 回傳成功")
-            except: print(f"   ❌ {retailer_name} 傳送失敗")
+            if result:
+                try:
+                    requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
+                    print(f"   ✅ {retailer_name} 回傳成功")
+                except: print(f"   ❌ {retailer_name} 傳送失敗")
+            else:
+                print(f"   ⚠️ {retailer_name} 資料不全，跳過壓日期")
 
         browser.close()
     print("🎉 任務結束！")
