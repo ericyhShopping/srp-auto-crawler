@@ -24,9 +24,9 @@ jobs:
           playwright install chromium
 
       - name: Run Crawler Script
-        # --- 這裡就是將 Secrets 餵給 Python 的地方 ---
+        # 注意：env 必須與 name, run 對齊
         env:
           GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
           GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
-        # 加上 -u 確保 log 即時顯示，並指向正確的檔名
+        # 使用 -u 確保 Print 訊息即時顯示
         run: python -u Cloud_track_url_v1.py
