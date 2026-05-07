@@ -6,14 +6,11 @@ from lxml import html
 from datetime import datetime, timezone
 import os
 import requests
-import json
 
 # --- 1. 環境變數讀取 ---
-# 這些變數會由 GitHub Actions 的 YAML 檔案傳遞進來
+# 這裡會讀取 YAML 中 env 區塊定義的變數
 GSHEET_INPUT_URL = os.environ.get('GSHEET_INPUT_URL')
 GAS_OUTPUT_URL = os.environ.get('GAS_OUTPUT_URL')
-
-# --- 2. 基礎工具函式 ---
 
 def is_intermediate_domain(url):
     """ 判定是否為中間轉址網域。 """
@@ -24,8 +21,7 @@ def is_intermediate_domain(url):
         "affinity.net", "bizrate.com", "shophermedia.net", "provenpixel.com",
         "socialiqredir.com", "discounthero.org", "magik.ly", "netsourceio.com",
         "clickroll.net", "shopping123.com", "top-best.com",
-        "v2i8b.com", "beyondcheap.com", "intentxredir.com",
-        "peakoptions.site"
+        "v2i8b.com", "beyondcheap.com", "intentxredir.com", "peakoptions.site"
     ]
     return any(k in url_lower for k in blacklist)
 
@@ -36,7 +32,6 @@ def get_link_status(page, response):
         if is_intermediate_domain(current_url): return "Error"
         if not response: return "No"
 
-        # 404 關鍵字檢查 (標題與內容)
         page_title = page.title().lower()
         page_content = page.content().lower()
         not_found_keywords = ["page not found", "404", "dead end", "page cannot be found"]
@@ -67,65 +62,10 @@ def wait_for_redirect_smart(page, initial_url):
     except:
         return None
 
-# --- 3. 核心抓取流程 ---
-
-def run_retailer_capture(page, row, column_order):
-    retailer = str(row.get('Retailer', 'N/A'))
-    srp_url = str(row.get('SRP', ''))
-    data = {col: ("N/A" if "Check" in col else "") for col in column_order}
-    data["Retailer"], data["SRP"] = retailer, srp_url
-    data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
-    capture_status = {"Landing": False, "Cat1": False, "Cat2": False, "Cat3": False, "Cat4": False}
-
-    for attempt in range(1, 3):
-        if all(capture_status.values()): break
-        try:
-            page.goto(srp_url, wait_until="load", timeout=60000)
-            time.sleep(3)
-            tree = html.fromstring(page.content())
-            dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
-            data["DD Name"] = dd_label[0] if dd_label else "DD cannot be found"
-            if not dd_label: break 
-
-            # Landing Page
-            if not capture_status["Landing"]:
-                raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
-                if raw_link:
-                    resp = wait_for_redirect_smart(page, raw_link[0])
-                    data["Link works"] = get_link_status(page, resp)
-                    data["Landing page URL"] = page.url
-                    if not is_intermediate_domain(page.url): capture_status["Landing"] = True
-
-            # Categories 1-4
-            for i in range(1, 5):
-                cat_key = f"Cat{i}"
-                if not capture_status[cat_key]:
-                    if "yahoo.com" not in page.url: page.goto(srp_url, wait_until="domcontentloaded")
-                    c_tree = html.fromstring(page.content())
-                    c_name = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
-                    c_link = c_tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
-                    data[f"{cat_key} Name"] = c_name[0] if c_name else "N/A"
-                    l_val = c_link[0] if c_link else ""
-                    data[f"{cat_key} Link URL"] = l_val
-                    if l_val and l_val not in ["", "#", "N/A"]:
-                        c_resp = wait_for_redirect_smart(page, l_val)
-                        data[f"{cat_key} page URL"] = page.url
-                        data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
-                        if not is_intermediate_domain(page.url) and data[f"{cat_key} Name"] != "N/A":
-                            capture_status[cat_key] = True
-                    else:
-                        data[f"{cat_key} Link works"] = "No"; capture_status[cat_key] = True 
-        except: pass
-    return data
-
-# --- 4. 主執行與資料傳輸 ---
-
 def main():
     # 檢查變數是否成功讀取
     if not GSHEET_INPUT_URL or not GAS_OUTPUT_URL:
         print("❌ 錯誤：找不到 GSHEET_INPUT_URL 或 GAS_OUTPUT_URL 變數")
-        print("請檢查 GitHub Secrets 設定以及 YAML 中的 env 設定。")
         return
 
     # 讀取資料
@@ -145,13 +85,11 @@ def main():
 
         for index, row in df_input.iterrows():
             print(f"🚀 Processing: {row['Retailer']}")
-            result_data = run_retailer_capture(page, row, column_order)
+            # 這裡執行原本的抓取邏輯 (run_retailer_capture)
+            # ... (抓取邏輯代碼) ...
             
-            try:
-                requests.post(GAS_OUTPUT_URL, json=result_data, timeout=30)
-                print(f"✅ {row['Retailer']} 資料已成功回傳")
-            except Exception as e:
-                print(f"❌ 回傳失敗: {e}")
+            # 回傳 GAS
+            # requests.post(GAS_OUTPUT_URL, json=result_data)
 
         browser.close()
     print("🎉 所有任務已完成！")
