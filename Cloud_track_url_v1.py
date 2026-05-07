@@ -15,7 +15,6 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 檢查 18 個關鍵欄位是否都有實質內容 """
     fields_to_check = [
         "Landing page URL", "Link works",
         "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
@@ -32,6 +31,7 @@ def is_data_complete(row_data):
 def is_intermediate_domain(url):
     if not url: return True
     url_lower = url.lower()
+    # 擴大黑名單，包含 ebay 的廣告追蹤網域
     blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "affinity.net", "bizrate.com", "ebay.com/rover", "rover.ebay.com", "peakoptions.site", "clickroll.net"]
     return any(k in url_lower for k in blacklist)
 
@@ -39,7 +39,8 @@ def get_link_status(page, response):
     try:
         current_url = page.url
         page_title = page.title().lower()
-        if "ebay.com" in current_url and not is_intermediate_domain(current_url): return "Yes"
+        # Ebay 快速判斷：只要進到 ebay 網域就給 Yes，不檢查內容，防止被阻擋頁面卡住
+        if "ebay.com" in current_url: return "Yes"
         if is_intermediate_domain(current_url): return "Error"
         if not response: return "No"
         not_found_keywords = ["page not found", "404", "dead end", "page cannot be found"]
@@ -51,15 +52,25 @@ def get_link_status(page, response):
     except: return "No"
 
 def wait_for_redirect_smart(page, initial_url):
+    """ 強化的 Ebay 防卡死跳轉邏輯 """
     try:
-        resp = page.goto(initial_url, wait_until="commit", timeout=35000)
-        for _ in range(5): 
-            if not is_intermediate_domain(page.url):
-                page.wait_for_timeout(1500)
+        # 對 Ebay 連結使用更短的逾時 (25秒)，並只要伺服器有回應 (commit) 就繼續
+        resp = page.goto(initial_url, wait_until="commit", timeout=25000)
+        
+        for _ in range(6): 
+            curr_url = page.url
+            # 如果已經跳出 Yahoo 且進入 Ebay，直接提早回傳，不再等待渲染
+            if "ebay.com" in curr_url and "rover" not in curr_url:
                 return resp
-            page.wait_for_timeout(2500) 
+            
+            if not is_intermediate_domain(curr_url):
+                page.wait_for_timeout(1000)
+                return resp
+            
+            page.wait_for_timeout(2000) 
         return resp
-    except: return None
+    except:
+        return None
 
 # --- 3. 核心抓取函式 ---
 
@@ -70,8 +81,9 @@ def run_retailer_capture(page, row, column_order):
     data["Retailer"], data["SRP"] = retailer, srp_url
     
     try:
-        page.goto(srp_url, wait_until="domcontentloaded", timeout=45000)
-        time.sleep(3) 
+        # 載入 Yahoo SRP，若 30 秒載不進去直接跳下一筆
+        page.goto(srp_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2) 
         tree = html.fromstring(page.content())
         
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
@@ -87,16 +99,15 @@ def run_retailer_capture(page, row, column_order):
         for i in range(1, 5):
             c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
-            cat_links_cache.append({
-                "name": c_name[0] if c_name else "N/A",
-                "link": c_link[0] if c_link else None
-            })
+            cat_links_cache.append({"name": c_name[0] if c_name else "N/A", "link": c_link[0] if c_link else None})
 
+        # 跳轉 Landing Page
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0])
             data["Link works"] = get_link_status(page, resp)
             data["Landing page URL"] = page.url
 
+        # 跳轉 Cat 1-4
         for i, cat in enumerate(cat_links_cache):
             cat_key = f"Cat{i+1}"
             data[f"{cat_key} Name"] = cat["name"]
@@ -108,34 +119,28 @@ def run_retailer_capture(page, row, column_order):
             else:
                 data[f"{cat_key} Link URL"] = "N/A"
 
-        # 核心防禦：如果 Landing page 沒抓到，這筆資料視為無效，不應該覆蓋舊資料
-        if not data["Landing page URL"] or data["Landing page URL"] == "":
-            return None
+        if not data["Landing page URL"]: return None
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
-
-    except:
-        return None
+    except: return None
 
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動任務：資料完整性保護版 (不完整不覆蓋)")
+    print("🚀 啟動任務：Ebay 防卡死與環境強化版")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: print("❌ 無法讀取來源名單"); return
 
     existing_records = {}
     try:
-        # 加入時間戳破解 CSV 快取
         fresh_url = f"{TRACK_URL_DATA_CSV}&t={int(time.time())}"
         df_existing = pd.read_csv(fresh_url)
         for _, r in df_existing[::-1].iterrows():
             name = str(r['Retailer']).strip()
             if name not in existing_records:
                 existing_records[name] = r.to_dict()
-        print(f"📊 成功加載歷史紀錄: {len(existing_records)} 筆")
     except: print("⚠️ 無歷史紀錄")
 
     column_order = [
@@ -148,10 +153,17 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        # 額外偽裝：設置更加真實的視窗大小
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="en-US", timezone_id="America/New_York"
+            locale="en-US", 
+            timezone_id="America/New_York",
+            viewport={"width": 1920, "height": 1080}
         )
+        
+        # 破解 Webdriver 偵測的核心 Script
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
         page = context.new_page()
         now = datetime.now(timezone.utc)
 
@@ -159,27 +171,25 @@ def main():
             retailer_name = str(row['Retailer']).strip()
             should_crawl = True
             
-            # --- 判斷是否需要重新爬取 ---
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
                 old_dd = str(old.get('DD Name', '')).strip().lower()
                 old_date_str = str(old.get('Update Date', ''))
                 
-                has_been_verified = (old_dd == "dd cannot be found")
-                
-                # 檢查時間是否在 7 天內
+                is_nf = (old_dd == "dd cannot be found")
                 within_7_days = False
-                if has_been_verified:
-                    try:
-                        clean_date = old_date_str.replace(" UTC", "")
-                        old_date = datetime.strptime(clean_date, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                        if now - old_date < timedelta(days=7):
-                            within_7_days = True
-                    except: pass
+                try:
+                    clean_date = old_date_str.replace(" UTC", "")
+                    old_date = datetime.strptime(clean_date, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                    if now - old_date < timedelta(days=7):
+                        within_7_days = True
+                except: pass
                 
-                # 如果「已驗證找不到」+「7天內」+「資料完整」，則 Skip
-                if has_been_verified and within_7_days and is_data_complete(old):
-                    print(f"⏭️  Skip: {retailer_name} (舊資料完整且未過期)")
+                if is_nf and within_7_days:
+                    print(f"⏭️  Skip: {retailer_name}")
+                    should_crawl = False
+                elif old_dd != "" and within_7_days and is_data_complete(old):
+                    print(f"⏭️  Skip: {retailer_name}")
                     should_crawl = False
 
             if not should_crawl: continue
@@ -187,21 +197,20 @@ def main():
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             new_result = run_retailer_capture(page, row, column_order)
             
-            # --- 核心邏輯：驗證新資料是否具備覆蓋資格 ---
-            if new_result and is_data_complete(new_result):
-                try:
-                    requests.post(GAS_OUTPUT_URL, json=new_result, timeout=25)
-                    print(f"   ✅ {retailer_name} 資料完整，執行覆蓋更新")
-                except: print(f"   ❌ {retailer_name} 傳送失敗")
-            else:
-                # 判斷是「確定找不到」還是「抓取失敗」
-                if new_result and str(new_result.get("DD Name")).lower() == "dd cannot be found":
-                    requests.post(GAS_OUTPUT_URL, json=new_result, timeout=25)
-                    print(f"   ✅ {retailer_name} 確認無 DD，執行狀態更新")
+            if new_result:
+                new_dd = str(new_result.get("DD Name")).lower()
+                if new_dd == "dd cannot be found" or is_data_complete(new_result):
+                    try:
+                        requests.post(GAS_OUTPUT_URL, json=new_result, timeout=25)
+                        print(f"   ✅ {retailer_name} 執行覆蓋更新")
+                    except: print(f"   ❌ {retailer_name} 傳送失敗")
                 else:
-                    print(f"   ⚠️ {retailer_name} 抓取結果不完整，放棄更新以保留舊資料")
+                    print(f"   ⚠️ {retailer_name} 抓取不全，保留舊資料")
+            else:
+                print(f"   ⚠️ {retailer_name} 抓取超時或失敗，跳過。")
             
-            time.sleep(random.uniform(2, 4))
+            # 增加隨機休眠
+            time.sleep(random.uniform(3, 6))
 
         browser.close()
     print("🎉 任務結束！")
