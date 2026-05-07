@@ -6,26 +6,29 @@ from lxml import html
 from datetime import datetime, timezone
 import os
 import requests
+import json
 
 # --- 1. 設定區域 ---
 GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
-GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
+# 這裡已更新為你提供的新 GAS 網址
+GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyLvET6p-l_zxQaoJqk-XLg6PEd--bBu__lqqRcc_LF70cgHmijRRpXSr2Kf50NHlLoiA/exec"
 
 # --- 2. 工具函式 ---
 
 def is_intermediate_domain(url):
+    """ 判定是否為 Yahoo 或中間跳轉網域 """
     if not url: return True
     url_lower = url.lower()
-    # 增加更多 Ebay 相關追蹤網域
-    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "affinity.net", "bizrate.com", "ebay.com/rover", "rover.ebay.com"]
+    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "affinity.net", "bizrate.com", "ebay.com/rover", "rover.ebay.com", "peakoptions.site"]
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
+    """ 檢查 404 關鍵字與網頁存取狀態 """
     try:
         current_url = page.url
         page_title = page.title().lower()
         
-        # Ebay 特別處理：只要網址裡有 ebay.com 且不是跳轉頁，直接算 Yes
+        # Ebay 特別快速通關
         if "ebay.com" in current_url and not is_intermediate_domain(current_url):
             return "Yes"
             
@@ -43,32 +46,29 @@ def get_link_status(page, response):
     except: return "No"
 
 def wait_for_redirect_smart(page, initial_url):
-    """ 強力加速版：縮短等待時間，防止在單一站點卡死超過 1 小時 """
+    """ 轉址追蹤（加速版） """
     try:
-        # 縮短 goto 等待，只要 commit (伺服器回應) 就好
-        resp = page.goto(initial_url, wait_until="commit", timeout=30000)
-        
-        # 最多等待 5 次 (約 12 秒)，跳不走就放棄
+        resp = page.goto(initial_url, wait_until="commit", timeout=35000)
         for _ in range(5): 
             if not is_intermediate_domain(page.url):
-                page.wait_for_timeout(1000) 
+                page.wait_for_timeout(1500) 
                 return resp
             page.wait_for_timeout(2500) 
         return resp
-    except:
-        return None
+    except: return None
 
 # --- 3. 核心抓取函式 ---
 
 def run_retailer_capture(page, row, column_order):
     retailer = str(row.get('Retailer', 'N/A'))
     srp_url = str(row.get('SRP', ''))
-    data = {col: ("N/A" if "Check" in col else "") for col in column_order}
+    
+    # 徹底移除 Link Check，僅初始化現有 22 個欄位
+    data = {col: "" for col in column_order}
     data["Retailer"], data["SRP"] = retailer, srp_url
     data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
     try:
-        # 設定整個 Retailer 抓取的總時限，防止卡死
         page.goto(srp_url, wait_until="load", timeout=30000)
         time.sleep(2)
         tree = html.fromstring(page.content())
@@ -76,17 +76,16 @@ def run_retailer_capture(page, row, column_order):
         data["DD Name"] = dd_label[0] if dd_label else "DD cannot be found"
         
         if dd_label:
-            # Landing Page
+            # Landing Page 抓取
             raw_link = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
             if raw_link:
                 resp = wait_for_redirect_smart(page, raw_link[0])
                 data["Link works"] = get_link_status(page, resp)
                 data["Landing page URL"] = page.url
 
-            # Categories (只抓前 4 個)
+            # Cat 1-4 抓取
             for i in range(1, 5):
                 cat_key = f"Cat{i}"
-                # 如果不在 SRP 頁面才跳回去
                 if "yahoo.com" not in page.url:
                     page.goto(srp_url, wait_until="domcontentloaded", timeout=20000)
                 
@@ -101,18 +100,27 @@ def run_retailer_capture(page, row, column_order):
                     c_resp = wait_for_redirect_smart(page, l_val)
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
-    except Exception as e:
-        print(f"      ⚠️ {retailer} 抓取逾時，強制跳過")
+    except:
+        pass
     return data
 
+# --- 4. 主執行流程 ---
+
 def main():
-    print("🚀 啟動優化版任務 (加速跳過 Ebay)...")
+    print("🚀 啟動任務：Link Check 已移除，使用新 GAS URL")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except Exception as e:
-        print(f"❌ 讀取來源失敗: {e}"); return
+        print(f"❌ 來源讀取失敗: {e}"); return
 
-    column_order = ["Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works", "Link Check", "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works", "Cat1 Link Check", "Cat2 Name", "Cat2 Link URL", "Cat2 page URL", "Cat2 Link works", "Cat2 Link Check", "Cat3 Name", "Cat3 Link URL", "Cat3 page URL", "Cat3 Link works", "Cat3 Link Check", "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works", "Cat4 Link Check"]
+    # 徹底移除所有 Link Check 相關欄位 (總共 22 個欄位)
+    column_order = [
+        "Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works",
+        "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
+        "Cat2 Name", "Cat2 Link URL", "Cat2 page URL", "Cat2 Link works",
+        "Cat3 Name", "Cat3 Link URL", "Cat3 page URL", "Cat3 Link works",
+        "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works"
+    ]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -123,21 +131,17 @@ def main():
             retailer_name = row['Retailer']
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             
-            # 開始抓取
             result_data = run_retailer_capture(page, row, column_order)
             
-            # 💡 關鍵：立即回傳！
             try:
-                r = requests.post(GAS_OUTPUT_URL, json=result_data, timeout=20)
-                if r.status_code == 200:
-                    print(f"✅ {retailer_name} 資料已傳回 Sheet")
-                else:
-                    print(f"❌ {retailer_name} 傳回失敗，狀態碼: {r.status_code}")
-            except Exception as e:
-                print(f"❌ {retailer_name} 網路傳輸出錯")
+                # 確保回傳正確的欄位
+                requests.post(GAS_OUTPUT_URL, json=result_data, timeout=30)
+                print(f"✅ {retailer_name} 資料已傳回")
+            except:
+                print(f"❌ {retailer_name} 網路回傳失敗")
 
         browser.close()
-    print("🎉 任務結束！")
+    print("🎉 任務完成！")
 
 if __name__ == "__main__":
     main()
