@@ -8,8 +8,8 @@ import os
 import requests
 import json
 
-# --- 1. 環境變數與設定 ---
-# 請確保在 GitHub Settings > Secrets 中設定了這兩個網址
+# --- 1. 環境變數讀取 ---
+# 這些變數會由 GitHub Actions 的 YAML 檔案傳遞進來
 GSHEET_INPUT_URL = os.environ.get('GSHEET_INPUT_URL')
 GAS_OUTPUT_URL = os.environ.get('GAS_OUTPUT_URL')
 
@@ -30,7 +30,7 @@ def is_intermediate_domain(url):
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
-    """ 核心判定邏輯：包含 404 關鍵字檢查與轉址判定。 """
+    """ 核心判定邏輯：包含 404 關鍵字檢查。 """
     try:
         current_url = page.url
         if is_intermediate_domain(current_url): return "Error"
@@ -56,10 +56,11 @@ def wait_for_redirect_smart(page, initial_url):
     """ 強制追蹤轉址，直到脫離 Yahoo/中間網域。 """
     try:
         resp = page.goto(initial_url, wait_until="commit", timeout=60000)
-        for _ in range(12): # 最多等待約 50 秒
+        for _ in range(12): 
             if not is_intermediate_domain(page.url):
                 page.wait_for_timeout(2000)
                 return resp
+            print(f"      ...等待跳轉中 (目前: {page.url[:50]}...)")
             page.mouse.move(random.randint(100, 300), random.randint(100, 300))
             page.wait_for_timeout(4000)
         return resp
@@ -77,7 +78,7 @@ def run_retailer_capture(page, row, column_order):
 
     capture_status = {"Landing": False, "Cat1": False, "Cat2": False, "Cat3": False, "Cat4": False}
 
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         if all(capture_status.values()): break
         try:
             page.goto(srp_url, wait_until="load", timeout=60000)
@@ -121,11 +122,13 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主執行與資料傳輸 ---
 
 def main():
+    # 檢查變數是否成功讀取
     if not GSHEET_INPUT_URL or not GAS_OUTPUT_URL:
         print("❌ 錯誤：找不到 GSHEET_INPUT_URL 或 GAS_OUTPUT_URL 變數")
+        print("請檢查 GitHub Secrets 設定以及 YAML 中的 env 設定。")
         return
 
-    # 讀取 Google Sheet 資料
+    # 讀取資料
     df_input = pd.read_csv(GSHEET_INPUT_URL)
     column_order = [
         "Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works", "Link Check",
@@ -137,19 +140,18 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)...")
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         page = context.new_page()
 
         for index, row in df_input.iterrows():
             print(f"🚀 Processing: {row['Retailer']}")
             result_data = run_retailer_capture(page, row, column_order)
             
-            # 每一筆抓完立刻透過 GAS 傳回 Google Sheet
             try:
                 requests.post(GAS_OUTPUT_URL, json=result_data, timeout=30)
-                print(f"✅ {row['Retailer']} 資料已傳回 Sheet")
+                print(f"✅ {row['Retailer']} 資料已成功回傳")
             except Exception as e:
-                print(f"❌ 傳回失敗: {e}")
+                print(f"❌ 回傳失敗: {e}")
 
         browser.close()
     print("🎉 所有任務已完成！")
