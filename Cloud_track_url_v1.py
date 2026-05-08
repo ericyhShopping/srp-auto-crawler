@@ -21,7 +21,6 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    # 💡 檢查資料是否完整，除了 DD 名稱外，網址與 works 欄位都不能為空
     fields_to_check = [
         "Landing page URL", "Link works",
         "Cat1 page URL", "Cat1 Link works",
@@ -48,7 +47,7 @@ def get_link_status(page, response):
         if is_intermediate_domain(curr_url): return "Error"
         not_found_keywords = ["page not found", "404", "dead end", "can't find that page", "dogs of amazon", "doesn't exist"]
         if any(k in page_title for k in not_found_keywords): return "404"
-        hard_sites = ["booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com", "kohls.com", "statefarm.com"]
+        hard_sites = ["lifelock.com", "booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com", "kohls.com", "statefarm.com"]
         if any(k in curr_url for k in hard_sites): return "Yes"
         if not response: return "No"
         status = response.status
@@ -59,8 +58,8 @@ def get_link_status(page, response):
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
     try:
-        hard_list = ["Booking", "Hotels", "JCPenney", "Lowe", "Robinhood", "Zappos", "Hilton", "Amazon", "Kohls", "State Farm"]
-        timeout = 50000 if any(k in retailer_name for k in hard_list) else 30000
+        hard_list = ["LifeLock", "Booking", "Hotels", "JCPenney", "Lowe", "Robinhood", "Zappos", "Hilton", "Amazon", "Kohls", "State Farm"]
+        timeout = 55000 if any(k in retailer_name for k in hard_list) else 30000
         resp = page.goto(initial_url, wait_until="commit", timeout=timeout, referer="https://search.yahoo.com/")
         page.mouse.wheel(0, random.randint(300, 600))
         last_url = ""
@@ -84,19 +83,21 @@ def run_retailer_capture(page, row, column_order):
     titles_map = {}
 
     try:
+        # 第一步：加載 Yahoo SRP 頁面
         page.goto(srp_url, wait_until="domcontentloaded", timeout=40000)
         time.sleep(4) 
         tree = html.fromstring(page.content())
-        dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         
-        # 💡 邏輯修正：優先判定 DD 狀態
+        # 💡 第二步：立即判定 DD 狀態，此時定論，後續不改。
+        dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         if not dd_label:
             data["DD Name"] = "DD cannot be found"
-            # 即使標記為 DD cannot be found，我們依然嘗試往下抓網址
+            print(f"   ℹ️  {retailer}: SRP 頁面未發現 DD，鎖定標籤。")
         else:
             data["DD Name"] = dd_label[0]
+            print(f"   ℹ️  {retailer}: 發現 DD -> {data['DD Name']}")
 
-        # 處理 Landing Page
+        # 第三步：獲取連結路徑 (這部分即便 DD 沒抓到也繼續做)
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
@@ -106,7 +107,6 @@ def run_retailer_capture(page, row, column_order):
                 titles_map["Landing"] = page.title().strip()
             else: data["Link works"] = "Error"
 
-        # 處理 Cat 1-4
         for i in range(1, 5):
             c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
@@ -123,7 +123,7 @@ def run_retailer_capture(page, row, column_order):
                 else: data[f"{cat_key} Link works"] = "Error"
             else: data[f"{cat_key} Link URL"] = "N/A"
 
-        # 檢查標題重複性
+        # 第四步：標題重複性檢查 (same)
         title_counts = Counter([t for t in titles_map.values() if t])
         same_count = 0
         for key, title in titles_map.items():
@@ -132,25 +132,24 @@ def run_retailer_capture(page, row, column_order):
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
-        # 💡 5 same 攔截判定
-        if same_count >= 5:
-            data["DD Name"] = "crawler failed"
-            return data # 回傳帶有 crawler failed 的資料包
-
-        # 如果連 Landing Page 都抓不到，視為爬蟲失敗
-        if not data["Landing page URL"]:
-            data["DD Name"] = "crawler failed"
-            return data
+        # 第五步：檢查攔截情況，僅當「連 Landing URL 都抓不到」或「5 same」時影響重爬，但不蓋掉已確定的 DD 名稱
+        if not data["Landing page URL"] or same_count >= 5:
+            # 這裡不覆蓋 DD Name，讓它維持 DD cannot be found 或原抓到的名稱
+            # 但因為 is_data_complete 會回傳 False，下小時仍會重試。
+            pass
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
-    except:
+
+    except Exception as e:
+        # 只有在 Yahoo SRP 階段就崩潰時，才標記為 crawler failed
+        print(f"   ❌ {retailer} SRP 加載失敗: {e}")
         data["DD Name"] = "crawler failed"
         return data
 
 # --- 4. 主流程 ---
 def main():
-    print("🚀 啟動任務：修正 DD cannot be found 優先權與 crawler failed 邏輯")
+    print("🚀 啟動任務：解耦 DD 判定與官網跳轉邏輯 (防止誤判)")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -185,7 +184,6 @@ def main():
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
                 old_dd = str(old.get('DD Name', '')).strip().lower()
-                # 判定重爬：空值、失敗、無 DD
                 if old_dd == "" or "crawler failed" in old_dd or "dd cannot be found" in old_dd:
                     should_crawl = True
                 else:
@@ -201,11 +199,10 @@ def main():
             print(f"🔍 Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
-            # 💡 判斷是否發送：只要 result 有資料就發送，不完整會包含 crawler failed
             if result:
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 資料更新 (狀態: {result['DD Name']})")
+                    print(f"   ✅ {retailer_name} 更新成功 (DD: {result['DD Name']})")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             
             time.sleep(random.uniform(5, 10))
