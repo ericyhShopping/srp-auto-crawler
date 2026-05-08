@@ -37,7 +37,12 @@ def is_data_complete(row_data):
 def is_intermediate_domain(url):
     if not url: return True
     url_lower = url.lower()
-    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "chrome-error://", "chromewebdata", "access-denied", "accessdenied", "viglink.com", "sovrn.com", "linkbux.com"]
+    # 💡 更新黑名單：加入 financebuzz.com 及其子網域
+    blacklist = [
+        "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
+        "chrome-error://", "chromewebdata", "access-denied", "accessdenied", 
+        "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com"
+    ]
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
@@ -49,7 +54,7 @@ def get_link_status(page, response):
         not_found_keywords = ["page not found", "404", "dead end", "can't find that page", "dogs of amazon", "doesn't exist"]
         if any(k in page_title for k in not_found_keywords): return "404"
         
-        # 高難度網站特許
+        # 高難度網站特許清單
         hard_sites = ["booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com", "kohls.com", "statefarm.com"]
         if any(k in curr_url for k in hard_sites): return "Yes"
         
@@ -84,8 +89,7 @@ def run_retailer_capture(page, row, column_order):
     srp_url = str(row.get('SRP', ''))
     data = {col: "" for col in column_order}
     data["Retailer"], data["SRP"] = retailer, srp_url
-    
-    titles_map = {} # 💡 存儲各個區塊的標題，用於重複性檢查
+    titles_map = {}
 
     try:
         page.goto(srp_url, wait_until="domcontentloaded", timeout=40000)
@@ -106,10 +110,13 @@ def run_retailer_capture(page, row, column_order):
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
+            # 💡 這裡會檢查是否轉跳到了 financebuzz 等黑名單網域
             if not is_intermediate_domain(page.url):
                 data["Landing page URL"] = page.url
                 data["Link works"] = get_link_status(page, resp)
                 titles_map["Landing"] = page.title().strip()
+            else:
+                data["Link works"] = "Error"
 
         # 處理 Cat 1-4
         for i in range(1, 5):
@@ -130,10 +137,10 @@ def run_retailer_capture(page, row, column_order):
             else:
                 data[f"{cat_key} Link URL"] = "N/A"
 
-        # 💡 核心檢查：標題重複性校驗
+        # 💡 檢查標題重複性
         title_counts = Counter([t for t in titles_map.values() if t])
         for key, title in titles_map.items():
-            if title_counts[title] > 2: # 標題重複超過 2 次 (即至少有 3 個標籤標題相同)
+            if title_counts[title] > 2:
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
@@ -142,9 +149,9 @@ def run_retailer_capture(page, row, column_order):
         return data
     except: return None
 
-# --- 4. 主流程 (與前版一致，包含 crawler failed 邏輯) ---
+# --- 4. 主流程 ---
 def main():
-    print("🚀 啟動任務：整合標題重複性偵測機制 (same)")
+    print("🚀 啟動任務：整合 FinanceBuzz 黑名單與標題偵測")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
