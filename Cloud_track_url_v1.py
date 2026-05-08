@@ -49,16 +49,10 @@ def get_link_status(page, response):
         curr_url = page.url
         page_title = page.title().lower()
         if is_intermediate_domain(curr_url): return "Error"
-        
-        # 標題特徵判定 (針對 Amazon 狗狗頁面或通用 404)
         not_found_keywords = ["page not found", "404", "dead end", "can't find that page", "dogs of amazon", "doesn't exist"]
-        if any(k in page_title for k in not_found_keywords):
-            return "404"
-        
-        # 針對特定高難度網站通行
-        hard_sites = ["booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com"]
+        if any(k in page_title for k in not_found_keywords): return "404"
+        hard_sites = ["booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com", "kohls.com", "statefarm.com"]
         if any(k in curr_url for k in hard_sites): return "Yes"
-            
         if not response: return "No"
         status = response.status
         if status == 404: return "404"
@@ -68,12 +62,10 @@ def get_link_status(page, response):
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
     try:
-        hard_list = ["Booking", "Hotels", "JCPenney", "Lowe", "Robinhood", "Zappos", "Hilton", "Amazon"]
+        hard_list = ["Booking", "Hotels", "JCPenney", "Lowe", "Robinhood", "Zappos", "Hilton", "Amazon", "Kohls", "State Farm"]
         timeout = 50000 if any(k in retailer_name for k in hard_list) else 30000
-        
         resp = page.goto(initial_url, wait_until="commit", timeout=timeout, referer="https://search.yahoo.com/")
         page.mouse.wheel(0, random.randint(300, 600))
-        
         last_url = ""
         for _ in range(12):
             curr_url = page.url
@@ -94,6 +86,7 @@ def run_retailer_capture(page, row, column_order):
     data["Retailer"], data["SRP"] = retailer, srp_url
     
     expected_no_dd = ["LifeLock", "REI", "Nordstrom", "Nordstrom Rack"]
+    captured_urls = [] # 💡 用於檢查 URL 唯一性
     
     try:
         page.goto(srp_url, wait_until="domcontentloaded", timeout=40000)
@@ -113,13 +106,8 @@ def run_retailer_capture(page, row, column_order):
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
+        # 處理 Landing Page
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
-        cat_links = []
-        for i in range(1, 5):
-            c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
-            c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
-            cat_links.append({"name": c_name[0] if c_name else "N/A", "link": c_link[0] if c_link else None})
-
         last_captured_url = ""
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
@@ -128,6 +116,14 @@ def run_retailer_capture(page, row, column_order):
                 data["Landing page URL"] = curr_url
                 data["Link works"] = get_link_status(page, resp)
                 last_captured_url = curr_url
+                captured_urls.append(curr_url)
+
+        # 處理 Cat 1-4
+        cat_links = []
+        for i in range(1, 5):
+            c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
+            c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
+            cat_links.append({"name": c_name[0] if c_name else "N/A", "link": c_link[0] if c_link else None})
 
         for i, cat in enumerate(cat_links):
             cat_key = f"Cat{i+1}"
@@ -137,14 +133,21 @@ def run_retailer_capture(page, row, column_order):
                 time.sleep(1.5)
                 c_resp = wait_for_redirect_smart(page, cat["link"], retailer)
                 curr_actual_url = page.url
-                if not is_intermediate_domain(curr_actual_url) and curr_actual_url != last_captured_url:
+                if not is_intermediate_domain(curr_actual_url):
                     data[f"{cat_key} page URL"] = curr_actual_url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
+                    captured_urls.append(curr_actual_url)
                 else:
                     data[f"{cat_key} page URL"] = ""
                     data[f"{cat_key} Link works"] = "Error"
             else:
                 data[f"{cat_key} Link URL"] = "N/A"
+
+        # 💡 核心修正：檢查所有抓到的 URL 是否都一模一樣（代表被導向首頁）
+        unique_urls = set([u.strip('/') for u in captured_urls if u])
+        if len(captured_urls) > 1 and len(unique_urls) == 1:
+            print(f"   🛑 偵測到網址全數重複 (可能是攔截重導向): {list(unique_urls)[0]}")
+            return None # 觸發外層的 crawler failed 邏輯
 
         if not data["Landing page URL"] or is_intermediate_domain(data["Landing page URL"]):
             return None
@@ -156,7 +159,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動任務：整合 DD cannot be found 與 crawler failed 重試機制")
+    print("🚀 啟動任務：整合 URL 唯一性校驗與失敗重試機制")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -201,9 +204,8 @@ def main():
                 old_dd = str(old.get('DD Name', '')).strip().lower()
                 old_date_str = str(old.get('Update Date', '')).strip()
                 
-                # 💡 判定機制：DD 為空、標記失敗、或標記 DD cannot be found，皆強制重爬
+                # 判定機制：空值、失敗或 DD cannot be found 均重爬
                 if old_dd == "" or old_dd == "nan" or "crawler failed" in old_dd or "dd cannot be found" in old_dd:
-                    print(f"🔥 強制重爬: {retailer_name} (狀態需修復: {old_dd})")
                     should_crawl = True
                 else:
                     within_7_days = False
@@ -220,14 +222,14 @@ def main():
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
-            if result and (str(result.get("DD Name")).lower() == "dd cannot be found" or is_data_complete(result)):
+            if result and is_data_complete(result):
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
                     print(f"   ✅ {retailer_name} 更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                # 抓取失敗紀錄發送
-                print(f"   ⚠️ {retailer_name} 抓取不完整，標記失敗紀錄...")
+                # 💡 這裡會捕捉到 URL 重複的情況並標記為 crawler failed
+                print(f"   ⚠️ {retailer_name} 抓取無效(重複或不全)，標記為 crawler failed")
                 fail_payload = {col: "" for col in column_order}
                 fail_payload["Retailer"] = retailer_name
                 fail_payload["SRP"] = srp_url
