@@ -21,12 +21,13 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
+    # 💡 檢查資料是否完整，除了 DD 名稱外，網址與 works 欄位都不能為空
     fields_to_check = [
         "Landing page URL", "Link works",
-        "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
-        "Cat2 Name", "Cat2 Link URL", "Cat2 page URL", "Cat2 Link works",
-        "Cat3 Name", "Cat3 Link URL", "Cat3 page URL", "Cat3 Link works",
-        "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works"
+        "Cat1 page URL", "Cat1 Link works",
+        "Cat2 page URL", "Cat2 Link works",
+        "Cat3 page URL", "Cat3 Link works",
+        "Cat4 page URL", "Cat4 Link works"
     ]
     for field in fields_to_check:
         val = str(row_data.get(field, "")).strip().lower()
@@ -88,14 +89,12 @@ def run_retailer_capture(page, row, column_order):
         tree = html.fromstring(page.content())
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         
+        # 💡 邏輯修正：優先判定 DD 狀態
         if not dd_label:
-            expected_no_dd = ["LifeLock", "REI", "Nordstrom", "Nordstrom Rack"]
-            if any(k in retailer for k in expected_no_dd):
-                data["DD Name"] = "DD cannot be found"
-                data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                return data
-            return None
-        data["DD Name"] = dd_label[0]
+            data["DD Name"] = "DD cannot be found"
+            # 即使標記為 DD cannot be found，我們依然嘗試往下抓網址
+        else:
+            data["DD Name"] = dd_label[0]
 
         # 處理 Landing Page
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
@@ -124,7 +123,7 @@ def run_retailer_capture(page, row, column_order):
                 else: data[f"{cat_key} Link works"] = "Error"
             else: data[f"{cat_key} Link URL"] = "N/A"
 
-        # 💡 檢查標題重複性
+        # 檢查標題重複性
         title_counts = Counter([t for t in titles_map.values() if t])
         same_count = 0
         for key, title in titles_map.items():
@@ -133,19 +132,25 @@ def run_retailer_capture(page, row, column_order):
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
-        # 💡 核心條件：如果 5 個連結全部被標記為 same，視為 crawler failed
+        # 💡 5 same 攔截判定
         if same_count >= 5:
-            print(f"   🛑 {retailer} 偵測到 5 個 same 標題，判定為攔截。")
-            return None # 觸發外層寫入 crawler failed
+            data["DD Name"] = "crawler failed"
+            return data # 回傳帶有 crawler failed 的資料包
 
-        if not data["Landing page URL"]: return None
+        # 如果連 Landing Page 都抓不到，視為爬蟲失敗
+        if not data["Landing page URL"]:
+            data["DD Name"] = "crawler failed"
+            return data
+
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
-    except: return None
+    except:
+        data["DD Name"] = "crawler failed"
+        return data
 
 # --- 4. 主流程 ---
 def main():
-    print("🚀 啟動任務：整合 5 same 攔截判定與 FinanceBuzz 過濾")
+    print("🚀 啟動任務：修正 DD cannot be found 優先權與 crawler failed 邏輯")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -196,23 +201,12 @@ def main():
             print(f"🔍 Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
-            # 💡 檢查結果：必須資料完整且沒有 same 被觸發到失敗門檻
-            if result and is_data_complete(result):
+            # 💡 判斷是否發送：只要 result 有資料就發送，不完整會包含 crawler failed
+            if result:
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 更新成功")
+                    print(f"   ✅ {retailer_name} 資料更新 (狀態: {result['DD Name']})")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
-            else:
-                # 💡 失敗標記邏輯：僅保留必要欄位
-                fail_payload = {col: "" for col in column_order}
-                fail_payload.update({
-                    "Retailer": retailer_name, 
-                    "SRP": srp_url, 
-                    "DD Name": "crawler failed", 
-                    "Update Date": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                })
-                requests.post(GAS_OUTPUT_URL, json=fail_payload, timeout=25)
-                print(f"   ⚠️ {retailer_name} 標記為 crawler failed (攔截或不全)")
             
             time.sleep(random.uniform(5, 10))
         browser.close()
