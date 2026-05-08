@@ -156,7 +156,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動任務：強制重試與失敗標記機制啟動...")
+    print("🚀 啟動任務：整合 DD cannot be found 與 crawler failed 重試機制")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -201,8 +201,9 @@ def main():
                 old_dd = str(old.get('DD Name', '')).strip().lower()
                 old_date_str = str(old.get('Update Date', '')).strip()
                 
-                # 💡 關鍵：若 DD Name 為空、NaN 或為 crawler failed，則強制重爬
-                if old_dd == "" or old_dd == "nan" or "crawler failed" in old_dd:
+                # 💡 判定機制：DD 為空、標記失敗、或標記 DD cannot be found，皆強制重爬
+                if old_dd == "" or old_dd == "nan" or "crawler failed" in old_dd or "dd cannot be found" in old_dd:
+                    print(f"🔥 強制重爬: {retailer_name} (狀態需修復: {old_dd})")
                     should_crawl = True
                 else:
                     within_7_days = False
@@ -225,7 +226,7 @@ def main():
                     print(f"   ✅ {retailer_name} 更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                # 💡 失敗處理：發送 crawler failed 紀錄，並包含目前日期
+                # 抓取失敗紀錄發送
                 print(f"   ⚠️ {retailer_name} 抓取不完整，標記失敗紀錄...")
                 fail_payload = {col: "" for col in column_order}
                 fail_payload["Retailer"] = retailer_name
