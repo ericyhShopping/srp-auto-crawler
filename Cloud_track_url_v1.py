@@ -21,7 +21,7 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 觸發爬蟲的核心判斷：改由 Landing page URL 決定 """
+    """ 觸發爬蟲的核心判斷：由 Landing page URL 決定 """
     landing_status = str(row_data.get("Landing page URL", "")).strip()
     
     # 💡 只要 Landing URL 是標註文字或空值，就視為不完整，需要重爬
@@ -90,16 +90,16 @@ def run_retailer_capture(page, row, column_order):
         time.sleep(4) 
         tree = html.fromstring(page.content())
         
-        # Step 2: DD 判定 (保留名稱)
+        # Step 2: DD 判定
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         if not dd_label:
-            # 💡 沒抓到 DD，註記在 Landing page URL
-            data["DD Name"] = "N/A"
+            # 💡 沒抓到 DD，僅註記在 Landing page URL，DD Name 保持初始空值
             data["Landing page URL"] = "DD cannot be found"
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            print(f"   ℹ️  {retailer}: 無 DD，註記狀態並跳過。")
             return data
         
-        # 抓到 DD 名稱，正常填入
+        # 抓到 DD 名稱，填入欄位
         data["DD Name"] = dd_label[0]
 
         # Step 3: 抓取官網
@@ -138,10 +138,9 @@ def run_retailer_capture(page, row, column_order):
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
-        # 💡 Step 5: 狀態覆寫邏輯 (不改 DD Name)
+        # Step 5: 狀態覆寫邏輯 (不改 DD Name)
         if same_count >= 5 or not data["Landing page URL"] or data["Landing page URL"] == "":
             data["Landing page URL"] = "crawler failed"
-            # 失敗時清空其他網址資訊
             for col in ["Cat1 page URL", "Cat1 Link works", "Cat2 page URL", "Cat2 Link works", "Cat3 page URL", "Cat3 Link works", "Cat4 page URL", "Cat4 Link works"]:
                 data[col] = ""
 
@@ -156,7 +155,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動優化版：Landing page URL 狀態標記與觸發機制重構")
+    print("🚀 啟動優化版：Landing page URL 標記與 DD Name 保護機制")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -190,12 +189,9 @@ def main():
             
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                # 💡 核心變動：由 is_data_complete 根據 Landing page URL 狀態決定是否重爬
                 is_complete = is_data_complete(old)
-                
                 try:
                     old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                    # 只有當資料完全正確（有網址、沒 same、沒 failed）且在 7 天內，才 Skip
                     if is_complete and (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
                         print(f"⏭️  Skip: {retailer_name}")
                         should_crawl = False
