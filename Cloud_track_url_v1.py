@@ -45,43 +45,31 @@ def is_intermediate_domain(url):
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
-    """ 重新找回 Title 判定邏輯，並強化 Amazon/eBay 特徵偵測 """
     try:
         curr_url = page.url
         page_title = page.title().lower()
-        
-        # 1. 黑名單判定 (轉址中介或瀏覽器錯誤)
         if is_intermediate_domain(curr_url): return "Error"
         
-        # 2. 標題關鍵字判定 (通用 404 偵測)
-        # 即使伺服器回傳 200，只要標題符合這些字眼，就判定為 404
+        # 標題特徵判定 (針對 Amazon 狗狗頁面或通用 404)
         not_found_keywords = ["page not found", "404", "dead end", "can't find that page", "dogs of amazon", "doesn't exist"]
         if any(k in page_title for k in not_found_keywords):
             return "404"
         
-        # 3. 內容特徵偵測 (針對 Amazon 等不改標題的頑強頁面)
-        content = page.content().lower()
-        if "amazon.com" in curr_url and "images-na.ssl-images-amazon.com/images/g/01/error/" in content:
-            return "404"
-
-        # 4. 高難度網站特許通行 (只要沒被擋 IP 就算 Yes)
-        if any(k in curr_url for k in ["hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com"]):
-            return "Yes"
+        # 針對特定高難度網站通行
+        hard_sites = ["booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com"]
+        if any(k in curr_url for k in hard_sites): return "Yes"
             
-        # 5. 標準 HTTP 狀態碼判定
         if not response: return "No"
         status = response.status
         if status == 404: return "404"
-        if status == 403 or "access denied" in page_title: return "Yes" # 403 視為連結存在但拒絕機房
-        
+        if status == 403 or "access denied" in page_title: return "Yes"
         return "Yes" if 200 <= status < 300 else "No"
-    except: 
-        return "No"
+    except: return "No"
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
     try:
-        hard_list = ["Hotels.com", "JCPenney", "Lowe's", "Robinhood", "Zappos", "Amazon", "Hilton"]
-        timeout = 45000 if any(k in retailer_name for k in hard_list) else 25000
+        hard_list = ["Booking", "Hotels", "JCPenney", "Lowe", "Robinhood", "Zappos", "Hilton", "Amazon"]
+        timeout = 50000 if any(k in retailer_name for k in hard_list) else 30000
         
         resp = page.goto(initial_url, wait_until="commit", timeout=timeout, referer="https://search.yahoo.com/")
         page.mouse.wheel(0, random.randint(300, 600))
@@ -90,19 +78,21 @@ def wait_for_redirect_smart(page, initial_url, retailer_name):
         for _ in range(12):
             curr_url = page.url
             if curr_url == last_url and not is_intermediate_domain(curr_url):
+                page.wait_for_timeout(1000)
                 return resp
             last_url = curr_url
             page.wait_for_timeout(2500)
         return resp
-    except:
-        return None
+    except: return None
 
-# --- run_retailer_capture 保持不變 (包含 last_captured_url 比對邏輯) ---
+# --- 3. 核心抓取函式 ---
+
 def run_retailer_capture(page, row, column_order):
     retailer = str(row.get('Retailer', 'N/A'))
     srp_url = str(row.get('SRP', ''))
     data = {col: "" for col in column_order}
     data["Retailer"], data["SRP"] = retailer, srp_url
+    
     expected_no_dd = ["LifeLock", "REI", "Nordstrom", "Nordstrom Rack"]
     
     try:
@@ -144,7 +134,7 @@ def run_retailer_capture(page, row, column_order):
             data[f"{cat_key} Name"] = cat["name"]
             if cat["link"]:
                 data[f"{cat_key} Link URL"] = cat["link"]
-                time.sleep(2)
+                time.sleep(1.5)
                 c_resp = wait_for_redirect_smart(page, cat["link"], retailer)
                 curr_actual_url = page.url
                 if not is_intermediate_domain(curr_actual_url) and curr_actual_url != last_captured_url:
@@ -158,13 +148,15 @@ def run_retailer_capture(page, row, column_order):
 
         if not data["Landing page URL"] or is_intermediate_domain(data["Landing page URL"]):
             return None
+
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
     except: return None
 
-# --- main 邏輯保持不變 (包含首次初始化與資料保護) ---
+# --- 4. 主流程 ---
+
 def main():
-    print("🚀 啟動任務：找回 Title 判定與強化 404 偵測版")
+    print("🚀 啟動任務：強制重試與失敗標記機制啟動...")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -203,13 +195,14 @@ def main():
             retailer_name = str(row['Retailer']).strip()
             srp_url = str(row.get('SRP', ''))
             should_crawl = True
-            is_new_entry = retailer_name not in existing_records
-
-            if not is_new_entry:
+            
+            if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                old_dd = str(old.get('DD Name', '')).strip()
+                old_dd = str(old.get('DD Name', '')).strip().lower()
                 old_date_str = str(old.get('Update Date', '')).strip()
-                if not old_dd or old_dd.lower() == 'nan':
+                
+                # 💡 關鍵：若 DD Name 為空、NaN 或為 crawler failed，則強制重爬
+                if old_dd == "" or old_dd == "nan" or "crawler failed" in old_dd:
                     should_crawl = True
                 else:
                     within_7_days = False
@@ -217,10 +210,7 @@ def main():
                         old_date = datetime.strptime(old_date_str.replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                         if now - old_date < timedelta(days=7): within_7_days = True
                     except: pass
-                    if old_dd.lower() == "dd cannot be found" and within_7_days:
-                        print(f"⏭️  Skip: {retailer_name}")
-                        should_crawl = False
-                    elif old_dd != "" and within_7_days and is_data_complete(old):
+                    if within_7_days and is_data_complete(old):
                         print(f"⏭️  Skip: {retailer_name}")
                         should_crawl = False
 
@@ -232,24 +222,24 @@ def main():
             if result and (str(result.get("DD Name")).lower() == "dd cannot be found" or is_data_complete(result)):
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 覆蓋更新成功")
+                    print(f"   ✅ {retailer_name} 更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
-                if is_new_entry:
-                    print(f"   ⚠️ {retailer_name} 為新項目且抓取受阻，執行首次初始化...")
-                    init_payload = {col: "" for col in column_order}
-                    init_payload["Retailer"] = retailer_name
-                    init_payload["SRP"] = srp_url
-                    try:
-                        requests.post(GAS_OUTPUT_URL, json=init_payload, timeout=25)
-                    except: pass
-                else:
-                    print(f"   ⚠️ {retailer_name} 抓取受阻，保留舊有完整資料。")
+                # 💡 失敗處理：發送 crawler failed 紀錄，並包含目前日期
+                print(f"   ⚠️ {retailer_name} 抓取不完整，標記失敗紀錄...")
+                fail_payload = {col: "" for col in column_order}
+                fail_payload["Retailer"] = retailer_name
+                fail_payload["SRP"] = srp_url
+                fail_payload["DD Name"] = "crawler failed"
+                fail_payload["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                try:
+                    requests.post(GAS_OUTPUT_URL, json=fail_payload, timeout=25)
+                except: pass
             
             time.sleep(random.uniform(5, 10))
 
         browser.close()
-    print("🎉 任務完成！")
+    print("🎉 任務結束！")
 
 if __name__ == "__main__":
     main()
