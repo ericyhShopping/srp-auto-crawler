@@ -21,21 +21,18 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 檢查網址與 works 欄位是否都有有效資料 """
-    # 💡 修正：如果 DD Name 是 DD cannot be found，視為一種已完成狀態，不需要檢查後續網址
-    if str(row_data.get("DD Name", "")).lower() == "dd cannot be found":
-        return True
+    """ 觸發爬蟲的核心判斷：改由 Landing page URL 決定 """
+    landing_status = str(row_data.get("Landing page URL", "")).strip()
+    
+    # 💡 只要 Landing URL 是標註文字或空值，就視為不完整，需要重爬
+    if landing_status.lower() in ["", "nan", "crawler failed", "dd cannot be found"]:
+        return False
         
-    fields_to_check = [
-        "Landing page URL", "Link works",
-        "Cat1 page URL", "Cat1 Link works",
-        "Cat2 page URL", "Cat2 Link works",
-        "Cat3 page URL", "Cat3 Link works",
-        "Cat4 page URL", "Cat4 Link works"
-    ]
+    # 如果 Landing URL 是正常網址，則檢查分類頁面是否齊全
+    fields_to_check = ["Cat1 page URL", "Cat2 page URL", "Cat3 page URL", "Cat4 page URL"]
     for field in fields_to_check:
         val = str(row_data.get(field, "")).strip().lower()
-        if val in ["", "nan", "undefined", "none", "null", "n/a", "same", "crawler failed"]:
+        if val in ["", "nan", "same", "error"]:
             return False
     return True
 
@@ -88,25 +85,24 @@ def run_retailer_capture(page, row, column_order):
     titles_map = {}
 
     try:
-        # Step 1: 加載 Yahoo SRP 頁面
+        # Step 1: 加載 Yahoo SRP
         page.goto(srp_url, wait_until="domcontentloaded", timeout=40000)
         time.sleep(4) 
         tree = html.fromstring(page.content())
         
-        # Step 2: DD 判定
+        # Step 2: DD 判定 (保留名稱)
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         if not dd_label:
-            # 💡 關鍵優化：沒抓到 DD 就直接結束，不進行官網爬取
-            data["DD Name"] = "DD cannot be found"
+            # 💡 沒抓到 DD，註記在 Landing page URL
+            data["DD Name"] = "N/A"
+            data["Landing page URL"] = "DD cannot be found"
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"   ℹ️  {retailer}: 無 DD，跳過後續抓取流程。")
             return data
         
-        # 標記 Yahoo 有 DD
+        # 抓到 DD 名稱，正常填入
         data["DD Name"] = dd_label[0]
-        has_dd_on_srp = True
 
-        # Step 3: 只有在有 DD 的情況下才抓取官網與分類
+        # Step 3: 抓取官網
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
@@ -114,7 +110,8 @@ def run_retailer_capture(page, row, column_order):
                 data["Landing page URL"] = page.url
                 data["Link works"] = get_link_status(page, resp)
                 titles_map["Landing"] = page.title().strip()
-            else: data["Link works"] = "Error"
+            else:
+                data["Landing page URL"] = "crawler failed"
 
         for i in range(1, 5):
             c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
@@ -129,10 +126,10 @@ def run_retailer_capture(page, row, column_order):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
                     titles_map[cat_key] = page.title().strip()
-                else: data[f"{cat_key} Link works"] = "Error"
-            else: data[f"{cat_key} Link URL"] = "N/A"
+                else:
+                    data[f"{cat_key} Link works"] = "Error"
 
-        # Step 4: 標題重複性偵測 (same)
+        # Step 4: same 偵測
         title_counts = Counter([t for t in titles_map.values() if t])
         same_count = 0
         for key, title in titles_map.items():
@@ -141,26 +138,25 @@ def run_retailer_capture(page, row, column_order):
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
-        # Step 5: 異常檢查 (有 DD 但抓取失敗)
-        if not data["Landing page URL"] or same_count >= 5 or not is_data_complete(data):
-            print(f"   ⚠️ {retailer}: 有 DD 但官網抓取異常，標記為 crawler failed")
-            data["DD Name"] = "crawler failed"
-            # 失敗時清空網址欄位
-            for col in ["Landing page URL", "Link works", "Cat1 page URL", "Cat1 Link works", "Cat2 page URL", "Cat2 Link works", "Cat3 page URL", "Cat3 Link works", "Cat4 page URL", "Cat4 Link works"]:
+        # 💡 Step 5: 狀態覆寫邏輯 (不改 DD Name)
+        if same_count >= 5 or not data["Landing page URL"] or data["Landing page URL"] == "":
+            data["Landing page URL"] = "crawler failed"
+            # 失敗時清空其他網址資訊
+            for col in ["Cat1 page URL", "Cat1 Link works", "Cat2 page URL", "Cat2 Link works", "Cat3 page URL", "Cat3 Link works", "Cat4 page URL", "Cat4 Link works"]:
                 data[col] = ""
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
 
     except Exception as e:
-        print(f"   ❌ SRP 階段失敗: {e}")
-        data["DD Name"] = "crawler failed"
+        data["Landing page URL"] = "crawler failed"
+        data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
 
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動優化版：DD cannot be found 即時斷路與清空欄位")
+    print("🚀 啟動優化版：Landing page URL 狀態標記與觸發機制重構")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -194,29 +190,24 @@ def main():
             
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                old_dd = str(old.get('DD Name', '')).strip().lower()
+                # 💡 核心變動：由 is_data_complete 根據 Landing page URL 狀態決定是否重爬
+                is_complete = is_data_complete(old)
                 
-                # 💡 重爬判定：空值、失敗或 DD cannot be found (因為我們要每小時確認 DD 是否回來)
-                if old_dd == "" or "crawler failed" in old_dd or "dd cannot be found" in old_dd:
-                    should_crawl = True
-                else:
-                    try:
-                        old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                        if (datetime.now(timezone.utc) - old_date < timedelta(days=7)) and is_data_complete(old):
-                            print(f"⏭️  Skip: {retailer_name}")
-                            should_crawl = False
-                    except: pass
+                try:
+                    old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                    # 只有當資料完全正確（有網址、沒 same、沒 failed）且在 7 天內，才 Skip
+                    if is_complete and (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
+                        print(f"⏭️  Skip: {retailer_name}")
+                        should_crawl = False
+                except: pass
 
             if not should_crawl: continue
 
             print(f"🔍 Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
-            
             if result:
-                try:
-                    requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 更新成功 (DD: {result['DD Name']})")
-                except: print(f"   ❌ {retailer_name} 傳送失敗")
+                requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
+                print(f"   ✅ {retailer_name} 更新成功 (Status: {result['Landing page URL']})")
             
             time.sleep(random.uniform(5, 10))
         browser.close()
