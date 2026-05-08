@@ -22,6 +22,10 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 
 def is_data_complete(row_data):
     """ 檢查網址與 works 欄位是否都有有效資料 """
+    # 💡 修正：如果 DD Name 是 DD cannot be found，視為一種已完成狀態，不需要檢查後續網址
+    if str(row_data.get("DD Name", "")).lower() == "dd cannot be found":
+        return True
+        
     fields_to_check = [
         "Landing page URL", "Link works",
         "Cat1 page URL", "Cat1 Link works",
@@ -36,31 +40,20 @@ def is_data_complete(row_data):
     return True
 
 def is_intermediate_domain(url):
-    """ 黑名單過濾：排除中介廣告頁與錯誤頁面 """
     if not url: return True
     url_lower = url.lower()
-    blacklist = [
-        "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
-        "chrome-error://", "chromewebdata", "access-denied", "accessdenied", 
-        "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com"
-    ]
+    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "chrome-error://", "chromewebdata", "access-denied", "accessdenied", "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com"]
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
-    """ 精準狀態偵測：結合狀態碼與標題特徵 """
     try:
         curr_url = page.url
         page_title = page.title().lower()
         if is_intermediate_domain(curr_url): return "Error"
-        
-        # 通用 404/狗狗頁面偵測
         not_found_keywords = ["page not found", "404", "dead end", "can't find that page", "dogs of amazon", "doesn't exist"]
         if any(k in page_title for k in not_found_keywords): return "404"
-        
-        # 高難度網站強制通行 (只要沒被擋 IP)
         hard_sites = ["lifelock.com", "booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com", "kohls.com", "statefarm.com"]
         if any(k in curr_url for k in hard_sites): return "Yes"
-        
         if not response: return "No"
         status = response.status
         if status == 404: return "404"
@@ -69,7 +62,6 @@ def get_link_status(page, response):
     except: return "No"
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
-    """ 智慧跳轉等待邏輯 """
     try:
         hard_list = ["LifeLock", "Booking", "Hotels", "JCPenney", "Lowe", "Robinhood", "Zappos", "Hilton", "Amazon", "Kohls", "State Farm"]
         timeout = 55000 if any(k in retailer_name for k in hard_list) else 30000
@@ -101,16 +93,20 @@ def run_retailer_capture(page, row, column_order):
         time.sleep(4) 
         tree = html.fromstring(page.content())
         
-        # Step 2: 判定 DD (第一真相)
+        # Step 2: DD 判定
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
-        has_dd_on_srp = False
         if not dd_label:
+            # 💡 關鍵優化：沒抓到 DD 就直接結束，不進行官網爬取
             data["DD Name"] = "DD cannot be found"
-        else:
-            data["DD Name"] = dd_label[0]
-            has_dd_on_srp = True
+            data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            print(f"   ℹ️  {retailer}: 無 DD，跳過後續抓取流程。")
+            return data
+        
+        # 標記 Yahoo 有 DD
+        data["DD Name"] = dd_label[0]
+        has_dd_on_srp = True
 
-        # Step 3: 抓取 Landing Page & Categories
+        # Step 3: 只有在有 DD 的情況下才抓取官網與分類
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
@@ -145,15 +141,13 @@ def run_retailer_capture(page, row, column_order):
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
-        # 💡 Step 5: 終極校驗邏輯
-        # 只要 Yahoo 有 DD，但後續「網址抓取失敗」或「5 same 攔截」，一律標記為 crawler failed
-        if has_dd_on_srp:
-            if not data["Landing page URL"] or same_count >= 5 or not is_data_complete(data):
-                print(f"   ⚠️ {retailer}: Yahoo 有 DD 但官網抓取異常，修正為 crawler failed")
-                data["DD Name"] = "crawler failed"
-                # 清空失敗的網址欄位以保持乾淨
-                for col in ["Landing page URL", "Link works", "Cat1 page URL", "Cat1 Link works", "Cat2 page URL", "Cat2 Link works", "Cat3 page URL", "Cat3 Link works", "Cat4 page URL", "Cat4 Link works"]:
-                    data[col] = ""
+        # Step 5: 異常檢查 (有 DD 但抓取失敗)
+        if not data["Landing page URL"] or same_count >= 5 or not is_data_complete(data):
+            print(f"   ⚠️ {retailer}: 有 DD 但官網抓取異常，標記為 crawler failed")
+            data["DD Name"] = "crawler failed"
+            # 失敗時清空網址欄位
+            for col in ["Landing page URL", "Link works", "Cat1 page URL", "Cat1 Link works", "Cat2 page URL", "Cat2 Link works", "Cat3 page URL", "Cat3 Link works", "Cat4 page URL", "Cat4 Link works"]:
+                data[col] = ""
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
@@ -166,7 +160,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動優化版：解耦 DD 判定與官網完整性強制校驗")
+    print("🚀 啟動優化版：DD cannot be found 即時斷路與清空欄位")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -201,13 +195,13 @@ def main():
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
                 old_dd = str(old.get('DD Name', '')).strip().lower()
-                # 判定重爬：空值、標記失敗、或標記 DD cannot be found，皆強制每小時重試
+                
+                # 💡 重爬判定：空值、失敗或 DD cannot be found (因為我們要每小時確認 DD 是否回來)
                 if old_dd == "" or "crawler failed" in old_dd or "dd cannot be found" in old_dd:
                     should_crawl = True
                 else:
                     try:
                         old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                        # 資料完整且在 7 天內，則 Skip
                         if (datetime.now(timezone.utc) - old_date < timedelta(days=7)) and is_data_complete(old):
                             print(f"⏭️  Skip: {retailer_name}")
                             should_crawl = False
@@ -221,7 +215,7 @@ def main():
             if result:
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                    print(f"   ✅ {retailer_name} 資料傳送成功 (DD: {result['DD Name']})")
+                    print(f"   ✅ {retailer_name} 更新成功 (DD: {result['DD Name']})")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             
             time.sleep(random.uniform(5, 10))
