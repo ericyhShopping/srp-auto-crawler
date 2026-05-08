@@ -30,19 +30,14 @@ def is_data_complete(row_data):
     ]
     for field in fields_to_check:
         val = str(row_data.get(field, "")).strip().lower()
-        if val in ["", "nan", "undefined", "none", "null", "n/a"]:
+        if val in ["", "nan", "undefined", "none", "null", "n/a", "same", "crawler failed"]:
             return False
     return True
 
 def is_intermediate_domain(url):
     if not url: return True
     url_lower = url.lower()
-    # 💡 更新黑名單：加入 financebuzz.com 及其子網域
-    blacklist = [
-        "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
-        "chrome-error://", "chromewebdata", "access-denied", "accessdenied", 
-        "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com"
-    ]
+    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "chrome-error://", "chromewebdata", "access-denied", "accessdenied", "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com"]
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
@@ -50,14 +45,10 @@ def get_link_status(page, response):
         curr_url = page.url
         page_title = page.title().lower()
         if is_intermediate_domain(curr_url): return "Error"
-        
         not_found_keywords = ["page not found", "404", "dead end", "can't find that page", "dogs of amazon", "doesn't exist"]
         if any(k in page_title for k in not_found_keywords): return "404"
-        
-        # 高難度網站特許清單
         hard_sites = ["booking.com", "hotels.com", "jcpenney.com", "lowes.com", "robinhood.com", "zappos.com", "hilton.com", "kohls.com", "statefarm.com"]
         if any(k in curr_url for k in hard_sites): return "Yes"
-        
         if not response: return "No"
         status = response.status
         if status == 404: return "404"
@@ -110,13 +101,11 @@ def run_retailer_capture(page, row, column_order):
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
-            # 💡 這裡會檢查是否轉跳到了 financebuzz 等黑名單網域
             if not is_intermediate_domain(page.url):
                 data["Landing page URL"] = page.url
                 data["Link works"] = get_link_status(page, resp)
                 titles_map["Landing"] = page.title().strip()
-            else:
-                data["Link works"] = "Error"
+            else: data["Link works"] = "Error"
 
         # 處理 Cat 1-4
         for i in range(1, 5):
@@ -132,17 +121,22 @@ def run_retailer_capture(page, row, column_order):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
                     titles_map[cat_key] = page.title().strip()
-                else:
-                    data[f"{cat_key} Link works"] = "Error"
-            else:
-                data[f"{cat_key} Link URL"] = "N/A"
+                else: data[f"{cat_key} Link works"] = "Error"
+            else: data[f"{cat_key} Link URL"] = "N/A"
 
         # 💡 檢查標題重複性
         title_counts = Counter([t for t in titles_map.values() if t])
+        same_count = 0
         for key, title in titles_map.items():
             if title_counts[title] > 2:
+                same_count += 1
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
+
+        # 💡 核心條件：如果 5 個連結全部被標記為 same，視為 crawler failed
+        if same_count >= 5:
+            print(f"   🛑 {retailer} 偵測到 5 個 same 標題，判定為攔截。")
+            return None # 觸發外層寫入 crawler failed
 
         if not data["Landing page URL"]: return None
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -151,7 +145,7 @@ def run_retailer_capture(page, row, column_order):
 
 # --- 4. 主流程 ---
 def main():
-    print("🚀 啟動任務：整合 FinanceBuzz 黑名單與標題偵測")
+    print("🚀 啟動任務：整合 5 same 攔截判定與 FinanceBuzz 過濾")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -186,6 +180,7 @@ def main():
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
                 old_dd = str(old.get('DD Name', '')).strip().lower()
+                # 判定重爬：空值、失敗、無 DD
                 if old_dd == "" or "crawler failed" in old_dd or "dd cannot be found" in old_dd:
                     should_crawl = True
                 else:
@@ -201,16 +196,23 @@ def main():
             print(f"🔍 Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             
+            # 💡 檢查結果：必須資料完整且沒有 same 被觸發到失敗門檻
             if result and is_data_complete(result):
                 try:
                     requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
                     print(f"   ✅ {retailer_name} 更新成功")
                 except: print(f"   ❌ {retailer_name} 傳送失敗")
             else:
+                # 💡 失敗標記邏輯：僅保留必要欄位
                 fail_payload = {col: "" for col in column_order}
-                fail_payload.update({"Retailer": retailer_name, "SRP": srp_url, "DD Name": "crawler failed", "Update Date": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')})
+                fail_payload.update({
+                    "Retailer": retailer_name, 
+                    "SRP": srp_url, 
+                    "DD Name": "crawler failed", 
+                    "Update Date": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                })
                 requests.post(GAS_OUTPUT_URL, json=fail_payload, timeout=25)
-                print(f"   ⚠️ {retailer_name} 標記為 crawler failed")
+                print(f"   ⚠️ {retailer_name} 標記為 crawler failed (攔截或不全)")
             
             time.sleep(random.uniform(5, 10))
         browser.close()
