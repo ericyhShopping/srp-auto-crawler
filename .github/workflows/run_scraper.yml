@@ -3,7 +3,7 @@ name: Hourly Retailer Scraper
 on:
   schedule:
     # 💡 設定每小時執行一次 (UTC 時間 0 分時觸發)
-    - cron: '0 * * * *'
+   - cron: '0 0 * * *'  # 每天台北時間早上 8 點執行一次
   workflow_dispatch: # 💡 允許手動點擊按鈕執行
 
 jobs:
