@@ -23,12 +23,8 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 def is_data_complete(row_data):
     """ 觸發爬蟲的核心判斷：由 Landing page URL 決定 """
     landing_status = str(row_data.get("Landing page URL", "")).strip()
-    
-    # 💡 只要 Landing URL 是標註文字或空值，就視為不完整，需要重爬
     if landing_status.lower() in ["", "nan", "crawler failed", "dd cannot be found"]:
         return False
-        
-    # 如果 Landing URL 是正常網址，則檢查分類頁面是否齊全
     fields_to_check = ["Cat1 page URL", "Cat2 page URL", "Cat3 page URL", "Cat4 page URL"]
     for field in fields_to_check:
         val = str(row_data.get(field, "")).strip().lower()
@@ -37,9 +33,15 @@ def is_data_complete(row_data):
     return True
 
 def is_intermediate_domain(url):
+    """ 黑名單：排除廣告轉址頁 """
     if not url: return True
     url_lower = url.lower()
-    blacklist = ["yahoo.com", "search.yahoo.com", "shopping.yahoo.com", "chrome-error://", "chromewebdata", "access-denied", "accessdenied", "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com"]
+    blacklist = [
+        "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
+        "chrome-error://", "chromewebdata", "access-denied", "accessdenied", 
+        "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com",
+        "validclick.net" # 💡 新增 validclick 黑名單
+    ]
     return any(k in url_lower for k in blacklist)
 
 def get_link_status(page, response):
@@ -93,44 +95,50 @@ def run_retailer_capture(page, row, column_order):
         # Step 2: DD 判定
         dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
         if not dd_label:
-            # 💡 沒抓到 DD，僅註記在 Landing page URL，DD Name 保持初始空值
             data["Landing page URL"] = "DD cannot be found"
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"   ℹ️  {retailer}: 無 DD，註記狀態並跳過。")
             return data
-        
-        # 抓到 DD 名稱，填入欄位
         data["DD Name"] = dd_label[0]
 
-        # Step 3: 抓取官網
-        landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
-        if landing_raw:
-            resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
+        # Step 3: 抓取官網與分類
+        # 定義抓取輔助函式
+        def capture(target_url, key):
+            if not target_url: return
+            resp = wait_for_redirect_smart(page, target_url, retailer)
             if not is_intermediate_domain(page.url):
-                data["Landing page URL"] = page.url
-                data["Link works"] = get_link_status(page, resp)
-                titles_map["Landing"] = page.title().strip()
+                actual_url = page.url
+                if key == "Landing":
+                    data["Landing page URL"] = actual_url
+                    data["Link works"] = get_link_status(page, resp)
+                else:
+                    data[f"{key} page URL"] = actual_url
+                    data[f"{key} Link works"] = get_link_status(page, resp)
+                
+                # 💡 標題淨化邏輯：去除品牌後綴，解決 State Farm 誤判 same 問題
+                raw_title = page.title().strip()
+                clean_title = raw_title.split('|')[0].split('-')[0].strip().lower()
+                if len(clean_title) > 3: # 避免抓到過短的無效標題
+                    titles_map[key] = clean_title
             else:
-                data["Landing page URL"] = "crawler failed"
+                if key == "Landing": data["Landing page URL"] = "crawler failed"
 
+        # 執行 Landing
+        landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
+        if landing_raw: capture(landing_raw[0], "Landing")
+
+        # 執行 Categories
         for i in range(1, 5):
-            c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
+            c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
             cat_key = f"Cat{i}"
             data[f"{cat_key} Name"] = c_name[0] if c_name else "N/A"
             if c_link:
                 data[f"{cat_key} Link URL"] = c_link[0]
-                time.sleep(1.5)
-                c_resp = wait_for_redirect_smart(page, c_link[0], retailer)
-                if not is_intermediate_domain(page.url):
-                    data[f"{cat_key} page URL"] = page.url
-                    data[f"{cat_key} Link works"] = get_link_status(page, c_resp)
-                    titles_map[cat_key] = page.title().strip()
-                else:
-                    data[f"{cat_key} Link works"] = "Error"
+                time.sleep(random.uniform(2, 4)) # 增加隨機間隔
+                capture(c_link[0], cat_key)
 
         # Step 4: same 偵測
-        title_counts = Counter([t for t in titles_map.values() if t])
+        title_counts = Counter([t for t in titles_map.values()])
         same_count = 0
         for key, title in titles_map.items():
             if title_counts[title] > 2:
@@ -138,11 +146,12 @@ def run_retailer_capture(page, row, column_order):
                 if key == "Landing": data["Link works"] = "same"
                 else: data[f"{key} Link works"] = "same"
 
-        # Step 5: 狀態覆寫邏輯 (不改 DD Name)
-        if same_count >= 5 or not data["Landing page URL"] or data["Landing page URL"] == "":
+        # Step 5: 狀態覆寫
+        if same_count >= 5 or not data["Landing page URL"] or data["Landing page URL"] == "crawler failed":
             data["Landing page URL"] = "crawler failed"
-            for col in ["Cat1 page URL", "Cat1 Link works", "Cat2 page URL", "Cat2 Link works", "Cat3 page URL", "Cat3 Link works", "Cat4 page URL", "Cat4 Link works"]:
-                data[col] = ""
+            for i in range(1, 5): 
+                data[f"Cat{i} page URL"] = ""
+                data[f"Cat{i} Link works"] = ""
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
@@ -155,7 +164,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動優化版：Landing page URL 標記與 DD Name 保護機制")
+    print("🚀 啟動優化版：標題淨化偵測與 ValidClick 黑名單過濾")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -189,13 +198,13 @@ def main():
             
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                is_complete = is_data_complete(old)
-                try:
-                    old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                    if is_complete and (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
-                        print(f"⏭️  Skip: {retailer_name}")
-                        should_crawl = False
-                except: pass
+                if is_data_complete(old):
+                    try:
+                        old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
+                            print(f"⏭️  Skip: {retailer_name}")
+                            should_crawl = False
+                    except: pass
 
             if not should_crawl: continue
 
@@ -203,7 +212,7 @@ def main():
             result = run_retailer_capture(page, row, column_order)
             if result:
                 requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
-                print(f"   ✅ {retailer_name} 更新成功 (Status: {result['Landing page URL']})")
+                print(f"   ✅ {retailer_name} 更新成功 (Landing Status: {result['Landing page URL']})")
             
             time.sleep(random.uniform(5, 10))
         browser.close()
