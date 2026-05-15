@@ -21,11 +21,10 @@ TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03Cvtl
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 檢查 Landing URL 是否為正常網址，若為標註字樣或空值則需重爬 """
+    """ 觸發爬蟲的核心判斷：由 Landing page URL 決定 """
     landing_status = str(row_data.get("Landing page URL", "")).strip()
     if landing_status.lower() in ["", "nan", "crawler failed", "dd cannot be found"]:
         return False
-    # 只要 Landing 正常，且有基本 Update Date，暫不強制 Cat 齊全以節省額度
     return True
 
 def is_intermediate_domain(url):
@@ -40,25 +39,32 @@ def is_intermediate_domain(url):
     return any(k in url_lower for k in blacklist)
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
-    """ 極速跳轉等待：大幅縮減循環次數與超時 """
+    """ 專對 eBay 優化的極速跳轉邏輯 """
     try:
-        # 針對 eBay 等慢速站點縮短超時
-        is_slow_site = any(k in retailer_name.lower() for k in ["ebay", "booking", "kohls", "statefarm"])
-        timeout = 20000 if is_slow_site else 35000
+        is_ebay = "ebay" in retailer_name.lower()
+        # 💡 eBay 專用：只給 15 秒，不等 load，只要 commit 就好
+        timeout = 15000 if is_ebay else 35000
         
-        # 快速 goto
-        resp = page.goto(initial_url, wait_until="commit", timeout=timeout, referer="https://search.yahoo.com/")
+        resp = page.goto(initial_url, wait_until="domcontentloaded", timeout=timeout, referer="https://search.yahoo.com/")
         
         last_url = ""
-        # 💡 僅循環 5 次 (約 8 秒)，原為 12 次
-        for _ in range(5):
+        # 💡 eBay 只要跳轉一次就檢查，不進入長時間循環
+        max_loops = 3 if is_ebay else 6
+        
+        for _ in range(max_loops):
             curr_url = page.url
+            # 💡 eBay 核心斷路器：只要進到 ebay.com 且脫離 rover 追蹤，立刻回傳
+            if is_ebay and "ebay.com" in curr_url and "rover.ebay" not in curr_url:
+                return resp
+            
             if curr_url == last_url and not is_intermediate_domain(curr_url):
                 return resp
+            
             last_url = curr_url
             page.wait_for_timeout(1500)
         return resp
-    except: return None
+    except:
+        return None
 
 # --- 3. 核心抓取函式 ---
 
@@ -89,18 +95,18 @@ def run_retailer_capture(page, row, column_order):
             if not is_intermediate_domain(page.url):
                 data["Landing page URL"] = page.url
                 data["Link works"] = "Yes"
-                # 標題淨化比對用
+                # 標題淨化 (處理 State Farm 重複標題)
                 t_raw = page.title().strip().split('|')[0].split('-')[0].strip().lower()
                 titles_map["Landing"] = t_raw
             else:
                 data["Landing page URL"] = "crawler failed"
 
-        # 💡 斷路：Landing 失敗則不跑 Categories
+        # 💡 額度斷路器：Landing 失敗則不跑 Categories，現省 4 次跳轉時間
         if data["Landing page URL"] == "crawler failed":
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
-        # Step 3: Categories (帶有同標題斷路邏輯)
+        # Step 3: Categories
         for i in range(1, 5):
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
             c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
@@ -115,14 +121,15 @@ def run_retailer_capture(page, row, column_order):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = "Yes"
                     
-                    # 💡 如果此分類標題與 Landing Page 相同，代表被導回首頁，直接停止後續分類抓取
+                    # 💡 標題斷路器：偵測到導回首頁立刻停止後續 Category
                     curr_t = page.title().strip().split('|')[0].split('-')[0].strip().lower()
                     if curr_t == titles_map.get("Landing") and len(curr_t) > 3:
                         data[f"{cat_key} Link works"] = "same"
-                        break # 跳出迴圈，不再抓 Cat 2, 3, 4
+                        break 
                 else:
                     data[f"{cat_key} Link works"] = "Error"
-            time.sleep(1) # 固定小延遲
+            # 💡 縮減 Category 間的等待
+            page.wait_for_timeout(1000)
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
@@ -134,7 +141,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 啟動極速節流版 (剩餘額度保護模式)")
+    print(f"🚀 極速模式啟動 | 本月剩餘額度預估支援中")
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except: return
@@ -157,9 +164,10 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        # 縮小 Viewport 減少渲染壓力
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
+            viewport={"width": 1024, "height": 768}
         )
         page = context.new_page()
         if stealth_sync: stealth_sync(page)
@@ -167,28 +175,25 @@ def main():
         for index, row in df_input.iterrows():
             retailer_name = str(row['Retailer']).strip()
             srp_url = str(row.get('SRP', ''))
-            should_crawl = True
             
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                # 💡 使用新版檢查邏輯
                 if is_data_complete(old):
                     try:
                         old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                         if (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
                             print(f"⏭️  Skip: {retailer_name}")
                             should_crawl = False
+                            continue
                     except: pass
-
-            if not should_crawl: continue
 
             print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
             result = run_retailer_capture(page, row, column_order)
             if result:
-                requests.post(GAS_OUTPUT_URL, json=result, timeout=25)
+                requests.post(GAS_OUTPUT_URL, json=result, timeout=20)
             
-            # 隨機等待縮短，節省總運行時間
-            time.sleep(random.uniform(3, 6))
+            # 💡 縮減 Retailer 之間的等待
+            time.sleep(random.uniform(2, 4))
             
         browser.close()
     print("🎉 任務結束！")
