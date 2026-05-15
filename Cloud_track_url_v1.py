@@ -40,7 +40,7 @@ def is_intermediate_domain(url):
         "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
         "chrome-error://", "chromewebdata", "access-denied", "accessdenied", 
         "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com",
-        "validclick.net", "shophermedia.net" # 💡 新增 shophermedia 黑名單
+        "validclick.net", "shophermedia.net", "rd.bizrate.com" # 💡 新增 shophermedia 黑名單
     ]
     return any(k in url_lower for k in blacklist)
 
