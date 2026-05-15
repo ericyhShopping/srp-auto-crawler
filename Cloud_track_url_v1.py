@@ -164,7 +164,64 @@ def run_retailer_capture(page, row, column_order):
         return data
 
 # --- 4. 主流程 ---
+
 def main():
-    print("🚀 啟動優化版：黑名單更新與額度節省邏輯啟動")
-    # ... (其餘 main 內容與前版一致) ...
-    # 此處略過，請直接替換你原本腳本的 main 部分
+    print(f"🚀 極速模式啟動 | 本月剩餘額度預估支援中")
+    try:
+        df_input = pd.read_csv(GSHEET_INPUT_URL)
+    except: return
+
+    existing_records = {}
+    try:
+        cb = random.randint(1000, 9999)
+        fresh_url = f"{TRACK_URL_DATA_CSV}&t={int(time.time())}&cb={cb}"
+        df_existing = pd.read_csv(fresh_url)
+        for _, r in df_existing[::-1].iterrows():
+            name = str(r['Retailer']).strip()
+            if name not in existing_records: existing_records[name] = r.to_dict()
+    except: pass
+
+    column_order = ["Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works", 
+                    "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
+                    "Cat2 Name", "Cat2 Link URL", "Cat2 page URL", "Cat2 Link works",
+                    "Cat3 Name", "Cat3 Link URL", "Cat3 page URL", "Cat3 Link works",
+                    "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works"]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        # 縮小 Viewport 減少渲染壓力
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1024, "height": 768}
+        )
+        page = context.new_page()
+        if stealth_sync: stealth_sync(page)
+
+        for index, row in df_input.iterrows():
+            retailer_name = str(row['Retailer']).strip()
+            srp_url = str(row.get('SRP', ''))
+            
+            if retailer_name in existing_records:
+                old = existing_records[retailer_name]
+                if is_data_complete(old):
+                    try:
+                        old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
+                            print(f"⏭️  Skip: {retailer_name}")
+                            should_crawl = False
+                            continue
+                    except: pass
+
+            print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
+            result = run_retailer_capture(page, row, column_order)
+            if result:
+                requests.post(GAS_OUTPUT_URL, json=result, timeout=20)
+            
+            # 💡 縮減 Retailer 之間的等待
+            time.sleep(random.uniform(2, 4))
+            
+        browser.close()
+    print("🎉 任務結束！")
+
+if __name__ == "__main__":
+    main()
