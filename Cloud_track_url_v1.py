@@ -17,38 +17,46 @@ TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV")
 
 def is_data_complete(row_data):
     """ 
-    🔥 超嚴格欄位完備性判定：
-    必須所有關鍵欄位都有健全的資料才算完成。任何一個欄位有缺失或異常字眼，一律重爬！
+    🔥 終極嚴格欄位完備性判定：
+    採用「最高優先級紅線攔截法」，只要任何欄位帶有異常字眼，一律判定不完整（False）。
     """
     try:
-        # 1. 檢查 Landing Page 基礎狀況
-        landing_status = str(row_data.get("Landing page URL", "")).strip().lower()
-        if landing_status in ["", "nan", "crawler failed", "dd cannot be found", "error", "same"]:
-            return False
-        
-        # 2. 檢查 Link works 狀態
+        # 1. 轉換所有基礎欄位為清洗後的字串
+        landing_url = str(row_data.get("Landing page URL", "")).strip().lower()
         link_works = str(row_data.get("Link works", "")).strip().lower()
+        
+        # 2. 【第一道紅線】檢查 Landing 基礎狀態與 works 狀態
+        if landing_url in ["", "nan", "crawler failed", "dd cannot be found", "error", "same"]:
+            return False
         if link_works in ["", "nan", "no", "error", "same"]:
             return False
 
-        # 3. 💡 逐一地毯式檢查 Cat1 到 Cat4 的所有欄位（只要一個欄位不及格就重爬）
+        # 3. 【第二道紅線】Cat1~4 地毯式絕對檢查
         for i in range(1, 5):
             name_val = str(row_data.get(f"Cat{i} Name", "")).strip().lower()
             link_url_val = str(row_data.get(f"Cat{i} Link URL", "")).strip().lower()
             page_url_val = str(row_data.get(f"Cat{i} page URL", "")).strip().lower()
             works_val = str(row_data.get(f"Cat{i} Link works", "")).strip().lower()
             
-            # 如果名字是 N/A，且連結相關欄位都是空的，代表 Yahoo 本身就沒這個分類，這算「正常完工」
-            if name_val == "n/a" and page_url_val in ["", "nan"] and link_url_val in ["", "nan"]:
-                continue
-                
-            # 如果有分類，但任何一個欄位出現空值、錯誤或 same，判定資料不足
-            if page_url_val in ["", "nan", "error"] or link_url_val in ["", "nan"] or works_val in ["", "nan", "error", "same"]:
+            # 🛑 核心校正點：只要 works、page URL 或 link URL 出現任何異常字眼，不管 Name 是什麼，一律直接攔截回傳 False！
+            if works_val in ["", "nan", "error", "same", "no"]:
                 return False
-                
+            if page_url_val in ["", "nan", "error", "same"]:
+                # 特例排除：如果 Name 確實是 n/a 且網址也是空或 nan，這在 Yahoo 沒分類時是合法的，允許通過
+                if name_val == "n/a" and page_url_val in ["", "nan"]:
+                    pass 
+                else:
+                    return False
+            if link_url_val in ["", "nan", "error"]:
+                if name_val == "n/a" and link_url_val in ["", "nan"]:
+                    pass
+                else:
+                    return False
+                    
+        # 通過所有紅線考驗，才算真正完整
         return True
     except:
-        return False # 有任何異常，保險起見一律重爬
+        return False
 
 def is_intermediate_domain(url):
     if not url: return True
