@@ -1,36 +1,51 @@
-name: Hourly Retailer Scraper
+name: Cloud Track URL
 
+# 設定觸發時機
 on:
   schedule:
-    # 💡 設定每小時執行一次 (UTC 時間 0 分時觸發)
-   - cron: '0 0 * * *'  # 每天台北時間早上 8 點執行一次
-  workflow_dispatch: # 💡 允許手動點擊按鈕執行
+    # 💡 每天 UTC 00:00 (台北時間早上 08:00) 自動執行一次
+    # 這樣設定最省時數，能完美確保新帳號的 2,000 分鐘撐過整個月
+    - cron: '0 0 * * *'
+  
+  # 允許你在 GitHub 網頁上手動點擊 "Run workflow" 觸發測試
+  workflow_dispatch:
 
+# 任務設定
 jobs:
-  scrape:
+  run-scraper:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      # Step 1: 複製專案程式碼到虛擬機
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Step 2: 設定 Python 環境
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip' # 啟用快取機制，加速後續安裝
 
-      - name: Install dependencies
+      # Step 3: 安裝自動化必備套件 (Playwright, pandas, lxml 等)
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install playwright pandas lxml requests
+          # 如果你有使用 playwright-stealth，取消下方註解：
+          # pip install playwright-stealth
 
+      # Step 4: 安裝 Chromium 瀏覽器核心
       - name: Install Playwright Browsers
         run: |
-          # 💡 只安裝必要的 Chromium 瀏覽器及其系統相依套件
-          python -m playwright install chromium --with-deps
+          playwright install chromium
 
-      - name: Run Scraper
-        run: python Cloud_track_url_v1.py
+      # Step 5: 執行爬蟲主程式，並安全注入 Secrets 變數
+      - name: Run Scraper Script
         env:
-          # 如果你有任何隱私變數可以放在這裡
-          PYTHONUNBUFFERED: 1
+          # 💡 將儲存在 GitHub 專案內部的 Secrets 映射成 Python 看得到的環境變數
+          GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
+          GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
+          TRACK_URL_DATA_CSV: ${{ secrets.TRACK_URL_DATA_CSV }}
+        run: |
+          python Cloud_track_url_v1.py
