@@ -16,11 +16,39 @@ TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV")
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 觸發爬蟲的核心基礎判斷：檢查主要網址是否健全 """
-    landing_status = str(row_data.get("Landing page URL", "")).strip().lower()
-    if landing_status in ["", "nan", "crawler failed", "dd cannot be found"]:
-        return False
-    return True
+    """ 
+    🔥 超嚴格欄位完備性判定：
+    必須所有關鍵欄位都有健全的資料才算完成。任何一個欄位有缺失或異常字眼，一律重爬！
+    """
+    try:
+        # 1. 檢查 Landing Page 基礎狀況
+        landing_status = str(row_data.get("Landing page URL", "")).strip().lower()
+        if landing_status in ["", "nan", "crawler failed", "dd cannot be found", "error", "same"]:
+            return False
+        
+        # 2. 檢查 Link works 狀態
+        link_works = str(row_data.get("Link works", "")).strip().lower()
+        if link_works in ["", "nan", "no", "error", "same"]:
+            return False
+
+        # 3. 💡 逐一地毯式檢查 Cat1 到 Cat4 的所有欄位（只要一個欄位不及格就重爬）
+        for i in range(1, 5):
+            name_val = str(row_data.get(f"Cat{i} Name", "")).strip().lower()
+            link_url_val = str(row_data.get(f"Cat{i} Link URL", "")).strip().lower()
+            page_url_val = str(row_data.get(f"Cat{i} page URL", "")).strip().lower()
+            works_val = str(row_data.get(f"Cat{i} Link works", "")).strip().lower()
+            
+            # 如果名字是 N/A，且連結相關欄位都是空的，代表 Yahoo 本身就沒這個分類，這算「正常完工」
+            if name_val == "n/a" and page_url_val in ["", "nan"] and link_url_val in ["", "nan"]:
+                continue
+                
+            # 如果有分類，但任何一個欄位出現空值、錯誤或 same，判定資料不足
+            if page_url_val in ["", "nan", "error"] or link_url_val in ["", "nan"] or works_val in ["", "nan", "error", "same"]:
+                return False
+                
+        return True
+    except:
+        return False # 有任何異常，保險起見一律重爬
 
 def is_intermediate_domain(url):
     if not url: return True
@@ -34,7 +62,6 @@ def is_intermediate_domain(url):
     return any(k in url_lower for k in blacklist)
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
-    """ 利用原生超時控制不卡死 """
     try:
         is_slow = any(k in retailer_name.lower() for k in ["ebay", "booking", "statefarm", "kohls"])
         timeout_ms = 15000 if is_slow else 30000
@@ -121,7 +148,7 @@ def run_retailer_capture(page, row, column_order):
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 安全、隱身、穩健版排程核心啟動中...", flush=True)
+    print("🚀 安全、隱身、全功能完美版排程核心啟動中...", flush=True)
     
     if not GSHEET_INPUT_URL or not GAS_OUTPUT_URL or not TRACK_URL_DATA_CSV:
         print("❌ 錯誤: 缺少必要的 GitHub Secrets 設定。")
@@ -169,19 +196,15 @@ def main():
             should_skip = False
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
-                landing_url_str = str(old.get("Landing page URL", "")).strip().lower()
                 
-                # 💡 修正後的精準比對：只有明確失敗或空值才重爬，絕不誤殺正常網址
-                is_failed_status = landing_url_str in ["crawler failed", "dd cannot be found", "", "nan", "error", "same"]
-                
-                if is_data_complete(old) and not is_failed_status:
+                # 💡 只有當「is_data_complete」嚴格檢驗過關（True）時，才允許去比對 7 天保護期
+                if is_data_complete(old):
                     try:
                         old_date_str = str(old.get('Update Date', '')).replace(" UTC", "").strip()
                         old_date = datetime.strptime(old_date_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
                         
-                        # 💡 嚴格執行 7 天 Skip 保護
                         if (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
-                            print(f"箱箱 ⏭️  Skip: {retailer_name} (資料健全且在 7 天保護期內)", flush=True)
+                            print(f"箱箱 ⏭️  Skip: {retailer_name} (所有欄位完全健全，且在 7 天保護期內)", flush=True)
                             should_skip = True
                     except Exception as e:
                         pass
@@ -189,7 +212,7 @@ def main():
             if should_skip: 
                 continue
 
-            print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}", flush=True)
+            print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name} (欄位不齊全或過期，啟動重爬)", flush=True)
             result = run_retailer_capture(page, row, column_order)
             
             if result:
