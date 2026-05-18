@@ -21,28 +21,23 @@ def is_data_complete(row_data):
     採用「最高優先級紅線攔截法」，只要任何欄位帶有異常字眼，一律判定不完整（False）。
     """
     try:
-        # 1. 轉換所有基礎欄位為清洗後的字串
         landing_url = str(row_data.get("Landing page URL", "")).strip().lower()
         link_works = str(row_data.get("Link works", "")).strip().lower()
         
-        # 2. 【第一道紅線】檢查 Landing 基礎狀態與 works 狀態
         if landing_url in ["", "nan", "crawler failed", "dd cannot be found", "error", "same"]:
             return False
         if link_works in ["", "nan", "no", "error", "same"]:
             return False
 
-        # 3. 【第二道紅線】Cat1~4 地毯式絕對檢查
         for i in range(1, 5):
             name_val = str(row_data.get(f"Cat{i} Name", "")).strip().lower()
             link_url_val = str(row_data.get(f"Cat{i} Link URL", "")).strip().lower()
             page_url_val = str(row_data.get(f"Cat{i} page URL", "")).strip().lower()
             works_val = str(row_data.get(f"Cat{i} Link works", "")).strip().lower()
             
-            # 🛑 核心校正點：只要 works、page URL 或 link URL 出現任何異常字眼，不管 Name 是什麼，一律直接攔截回傳 False！
             if works_val in ["", "nan", "error", "same", "no"]:
                 return False
             if page_url_val in ["", "nan", "error", "same"]:
-                # 特例排除：如果 Name 確實是 n/a 且網址也是空或 nan，這在 Yahoo 沒分類時是合法的，允許通過
                 if name_val == "n/a" and page_url_val in ["", "nan"]:
                     pass 
                 else:
@@ -52,8 +47,6 @@ def is_data_complete(row_data):
                     pass
                 else:
                     return False
-                    
-        # 通過所有紅線考驗，才算真正完整
         return True
     except:
         return False
@@ -100,6 +93,7 @@ def run_retailer_capture(page, row, column_order):
     titles_map = {}
 
     try:
+        # Step 1: 加載 Yahoo SRP
         page.goto(srp_url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
         tree = html.fromstring(page.content())
@@ -111,6 +105,7 @@ def run_retailer_capture(page, row, column_order):
             return data
         data["DD Name"] = dd_label[0]
 
+        # Step 2: Landing Page
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
             resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
@@ -126,6 +121,9 @@ def run_retailer_capture(page, row, column_order):
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
+        # Step 3: 抓取分類 Categories
+        has_cat_failed = False # 💡 宣告一個旗標，用來記錄是否有任何一個分類失敗
+        
         for i in range(1, 5):
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
             c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
@@ -135,16 +133,35 @@ def run_retailer_capture(page, row, column_order):
             if c_link:
                 data[f"{cat_key} Link URL"] = c_link[0]
                 wait_for_redirect_smart(page, c_link[0], retailer)
+                
                 if not is_intermediate_domain(page.url):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = "Yes"
                     curr_t = page.title().strip().split('|')[0].split('-')[0].strip().lower()
                     if curr_t == titles_map.get("Landing") and len(curr_t) > 3:
                         data[f"{cat_key} Link works"] = "same"
+                        has_cat_failed = True # 踩到 same 算失敗
                         break
                 else:
                     data[f"{cat_key} Link works"] = "Error"
+                    has_cat_failed = True # 踩到黑名單算失敗
+            else:
+                # 如果 Yahoo 面板上明明「沒有分類」，這本來就應該是 N/A，不列入失敗
+                if data[f"{cat_key} Name"] == "N/A":
+                    pass
+                else:
+                    has_cat_failed = True # 有名字卻沒抓到連結，算失敗
+
+            # 💡 雙重保險：如果網址根本沒成功寫入，直接標記本輪失敗
+            if c_link and (not data[f"{cat_key} page URL"] or data[f"{cat_key} page URL"] in ["", "nan"]):
+                has_cat_failed = True
+
             time.sleep(1)
+
+        # 💡 【核心覆寫閘門】只要 Cat 1~4 任何一個分類在抓取中途殘缺了，全體降級為 crawler failed
+        if has_cat_failed:
+            print(f"   ⚠️ 偵測到分類抓取不齊全，強制將 {retailer} 標記為 crawler failed 重爬狀態。")
+            data["Landing page URL"] = "crawler failed"
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
@@ -205,7 +222,6 @@ def main():
             if retailer_name in existing_records:
                 old = existing_records[retailer_name]
                 
-                # 💡 只有當「is_data_complete」嚴格檢驗過關（True）時，才允許去比對 7 天保護期
                 if is_data_complete(old):
                     try:
                         old_date_str = str(old.get('Update Date', '')).replace(" UTC", "").strip()
