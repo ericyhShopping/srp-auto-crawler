@@ -10,7 +10,10 @@ on:
   # 允許你在 GitHub 網頁上手動點擊 "Run workflow" 觸發測試
   workflow_dispatch:
 
-# 任務設定
+# 全域環境變數設定：解決 Node.js 20 淘汰警告，強制改用 Node.js 24 運行
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
@@ -27,13 +30,11 @@ jobs:
           python-version: '3.10'
           cache: 'pip' # 啟用快取機制，加速後續安裝
 
-      # Step 3: 安裝自動化必備套件 (Playwright, pandas, lxml 等)
+      # Step 3: 安裝自動化必備套件 (確保安裝 playwright-stealth 隱身特徵)
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright pandas lxml requests
-          # 如果你有使用 playwright-stealth，取消下方註解：
-          # pip install playwright-stealth
+          pip install playwright pandas lxml requests playwright-stealth
 
       # Step 4: 安裝 Chromium 瀏覽器核心
       - name: Install Playwright Browsers
@@ -43,7 +44,7 @@ jobs:
       # Step 5: 執行爬蟲主程式，並安全注入 Secrets 變數
       - name: Run Scraper Script
         env:
-          # 💡 將儲存在 GitHub 專案內部的 Secrets 映射成 Python 看得到的環境變數
+          # 將儲存在 GitHub 專案內部的 Secrets 映射成 Python 看得到的環境變數
           GSHEET_INPUT_URL: ${{ secrets.GSHEET_INPUT_URL }}
           GAS_OUTPUT_URL: ${{ secrets.GAS_OUTPUT_URL }}
           TRACK_URL_DATA_CSV: ${{ secrets.TRACK_URL_DATA_CSV }}
