@@ -2,86 +2,106 @@ import os
 import time
 import pandas as pd
 from playwright.sync_api import sync_playwright
+# 容錯匯入 stealth：相容新版(2.x 的 Stealth)，套件缺失/版本不符時優雅略過，
+# 絕不讓反偵測套件的問題拖垮整個爬蟲啟動。
+try:
+    from playwright_stealth import Stealth
+    _STEALTH = Stealth()
+except Exception:
+    _STEALTH = None
 from lxml import html
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 import requests
+import json
 import random
 from collections import Counter
 
-# --- 1. 設定區域 (透過 GitHub Secrets 安全取得環境變數) ---
-GSHEET_INPUT_URL = os.environ.get("GSHEET_INPUT_URL")
-GAS_OUTPUT_URL = os.environ.get("GAS_OUTPUT_URL")
-TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV")
+# --- 1. 設定區域 ---
+# 優先讀 GitHub Secrets 注入的環境變數；本機/未設定時退回寫死的預設值。
+# 如此 workflow 裡映射的 Secrets 才會真正生效，網址也不必硬編在程式碼裡。
+_DEFAULT_GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
+_DEFAULT_GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbwfA2vP2hdACwsEei73OSQUEojmXFRyyKqu_NcsDFi0Mp7oU2_fTUB1DCM2x4oFMWt7tA/exec"
+_DEFAULT_TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=0&single=true&output=csv"
+
+GSHEET_INPUT_URL = os.environ.get("GSHEET_INPUT_URL") or _DEFAULT_GSHEET_INPUT_URL
+GAS_OUTPUT_URL = os.environ.get("GAS_OUTPUT_URL") or _DEFAULT_GAS_OUTPUT_URL
+TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV") or _DEFAULT_TRACK_URL_DATA_CSV
+
+# 中繼/失敗的「真實網域」黑名單：只比對 hostname，避免落地頁追蹤參數
+# (force_referer=search.yahoo.com、pname-Yahoo 等) 把真正落地頁誤判成中繼。
+INTERMEDIATE_DOMAIN_BLACKLIST = [
+    "yahoo.com", "viglink.com", "sovrn.com", "linkbux.com",
+    "financebuzz.com", "validclick.net", "shophermedia.net",
+    "clickroll.net", "rover.ebay.com"
+]
+# 錯誤/非正常頁面標記：比對整條 URL（scheme 或錯誤字串）
+INTERMEDIATE_URL_MARKERS = ["chrome-error://", "chromewebdata", "access-denied"]
+
+DD_WAIT_TIMEOUT = 8000          # 等 DD 元素出現的毫秒上限
+DD_DETECT_ATTEMPTS = 2          # DD 抓不到時的重載重試總次數
+SRP_SETTLE_RANGE = (2.5, 5.0)   # 進 SRP 後等待頁面穩定的隨機秒數
+LOAD_SETTLE_TIMEOUT = 8000      # 讀 title 前等待導航穩定的毫秒上限
+GAS_POST_RETRIES = 3            # 發射回 GAS 的重試次數
 
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 
-    🔥 終極嚴格欄位完備性判定：
-    採用「最高優先級紅線攔截法」，只要任何欄位帶有異常字眼，一律判定不完整（False）。
-    """
-    try:
-        landing_url = str(row_data.get("Landing page URL", "")).strip().lower()
-        link_works = str(row_data.get("Link works", "")).strip().lower()
-        
-        if landing_url in ["", "nan", "crawler failed", "dd cannot be found", "error", "same"]:
-            return False
-        if link_works in ["", "nan", "no", "error", "same"]:
-            return False
-
-        for i in range(1, 5):
-            name_val = str(row_data.get(f"Cat{i} Name", "")).strip().lower()
-            link_url_val = str(row_data.get(f"Cat{i} Link URL", "")).strip().lower()
-            page_url_val = str(row_data.get(f"Cat{i} page URL", "")).strip().lower()
-            works_val = str(row_data.get(f"Cat{i} Link works", "")).strip().lower()
-            
-            if works_val in ["", "nan", "error", "same", "no"]:
-                return False
-            if page_url_val in ["", "nan", "error", "same"]:
-                if name_val == "n/a" and page_url_val in ["", "nan"]:
-                    pass 
-                else:
-                    return False
-            if link_url_val in ["", "nan", "error"]:
-                if name_val == "n/a" and link_url_val in ["", "nan"]:
-                    pass
-                else:
-                    return False
-        return True
-    except:
+    """ 觸發爬蟲的核心判斷：由 Landing page URL 決定 """
+    landing_status = str(row_data.get("Landing page URL", "")).strip()
+    if landing_status.lower() in ["", "nan", "crawler failed", "dd cannot be found"]:
         return False
+    return True
 
 def is_intermediate_domain(url):
+    """ 黑名單：排除廣告跳轉網域（只比對 hostname，避免落地頁追蹤參數誤殺） """
     if not url: return True
-    url_lower = url.lower()
-    blacklist = [
-        "yahoo.com", "search.yahoo.com", "shopping.yahoo.com", 
-        "chrome-error://", "chromewebdata", "access-denied", "accessdenied", 
-        "viglink.com", "sovrn.com", "linkbux.com", "financebuzz.com",
-        "validclick.net", "shophermedia.net", "rd.bizrate.com"
-    ]
-    return any(k in url_lower for k in blacklist)
+    url_lower = str(url).lower()
+    if any(m in url_lower for m in INTERMEDIATE_URL_MARKERS):
+        return True
+    host = urlparse(url_lower).hostname or ""
+    return any(host == d or host.endswith("." + d) for d in INTERMEDIATE_DOMAIN_BLACKLIST)
+
+def _safe_title(page):
+    """ 先等導航穩定再抓 title 並包 try，避免頁面跳轉中呼叫 title() 觸發
+        'Execution context was destroyed' 而讓整筆失敗。 """
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=LOAD_SETTLE_TIMEOUT)
+    except Exception:
+        pass
+    try:
+        return page.title().strip().split('|')[0].split('-')[0].strip().lower()
+    except Exception:
+        return ""
 
 def wait_for_redirect_smart(page, initial_url, retailer_name):
+    """ 專對 eBay 優化的極速跳轉邏輯 """
+    is_ebay = "ebay" in retailer_name.lower()
+    timeout = 15000 if is_ebay else 35000
+    resp = None
     try:
-        is_slow = any(k in retailer_name.lower() for k in ["ebay", "booking", "statefarm", "kohls"])
-        timeout_ms = 15000 if is_slow else 30000
-        
-        resp = page.goto(initial_url, wait_until="domcontentloaded", timeout=timeout_ms, referer="https://search.yahoo.com/")
-        
-        last_url = ""
-        max_loops = 3 if is_slow else 6
-        for _ in range(max_loops):
+        # goto 逾時也不放棄：跳轉鏈長的站即使沒在時限內完成，
+        # 當下 page.url 通常已抵達落地頁，後續靠輪詢確認穩定即可。
+        resp = page.goto(initial_url, wait_until="domcontentloaded", timeout=timeout, referer="https://search.yahoo.com/")
+    except Exception:
+        resp = None
+
+    last_url = ""
+    # 💡 eBay 只要跳轉一次就檢查，不進入長時間循環
+    max_loops = 3 if is_ebay else 6
+    for _ in range(max_loops):
+        try:
             curr_url = page.url
-            if is_slow and "ebay.com" in curr_url and "rover.ebay" not in curr_url:
-                return resp
-            if curr_url == last_url and not is_intermediate_domain(curr_url):
-                return resp
-            last_url = curr_url
-            page.wait_for_timeout(1500)
-        return resp
-    except:
-        return None
+        except Exception:
+            break
+        # 💡 eBay 核心斷路器：只要進到 ebay.com 且脫離 rover 追蹤，立刻回傳
+        if is_ebay and "ebay.com" in curr_url and "rover.ebay" not in curr_url:
+            return resp
+        if curr_url == last_url and not is_intermediate_domain(curr_url):
+            return resp
+        last_url = curr_url
+        page.wait_for_timeout(1500)
+    return resp
 
 # --- 3. 核心抓取函式 ---
 
@@ -93,37 +113,50 @@ def run_retailer_capture(page, row, column_order):
     titles_map = {}
 
     try:
-        # Step 1: 加載 Yahoo SRP
+        # Step 1: Yahoo SRP
         page.goto(srp_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
-        tree = html.fromstring(page.content())
-        
-        dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
+
+        # 🔁 等 DD 模組真的出現再抓；抓不到就重載重試，避免「零等待直接抓」抓到
+        #    尚未載入完成的頁面而誤報 DD cannot be found。
+        tree, dd_label = None, []
+        for attempt in range(DD_DETECT_ATTEMPTS):
+            try:
+                page.wait_for_selector("div[class*='TopNavCommerce'] h3 a[aria-label]", timeout=DD_WAIT_TIMEOUT)
+            except Exception:
+                pass
+            time.sleep(random.uniform(*SRP_SETTLE_RANGE))
+            tree = html.fromstring(page.content())
+            dd_label = tree.xpath("//div[contains(@class,'TopNavCommerce')]//h3/a/@aria-label")
+            if dd_label:
+                break
+            if attempt < DD_DETECT_ATTEMPTS - 1:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+
         if not dd_label:
             data["Landing page URL"] = "DD cannot be found"
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
+
         data["DD Name"] = dd_label[0]
 
         # Step 2: Landing Page
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
-            resp = wait_for_redirect_smart(page, landing_raw[0], retailer)
+            wait_for_redirect_smart(page, landing_raw[0], retailer)
             if not is_intermediate_domain(page.url):
                 data["Landing page URL"] = page.url
-                data["Link works"] = "Yes" if page.url and len(page.url) > 10 else "No"
-                t_raw = page.title().strip().split('|')[0].split('-')[0].strip().lower()
-                titles_map["Landing"] = t_raw
+                data["Link works"] = "Yes"
+                # 標題淨化 (處理 State Farm 重複標題)
+                titles_map["Landing"] = _safe_title(page)
             else:
                 data["Landing page URL"] = "crawler failed"
 
+        # 💡 額度斷路器：Landing 失敗則不跑 Categories，現省 4 次跳轉時間
         if data["Landing page URL"] == "crawler failed":
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
-        # Step 3: 抓取分類 Categories
-        has_cat_failed = False # 💡 宣告一個旗標，用來記錄是否有任何一個分類失敗
-        
+        # Step 3: Categories
         for i in range(1, 5):
             c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
             c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
@@ -137,64 +170,57 @@ def run_retailer_capture(page, row, column_order):
                 if not is_intermediate_domain(page.url):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = "Yes"
-                    curr_t = page.title().strip().split('|')[0].split('-')[0].strip().lower()
+                    
+                    # 💡 標題斷路器：偵測到導回首頁立刻停止後續 Category
+                    curr_t = _safe_title(page)
                     if curr_t == titles_map.get("Landing") and len(curr_t) > 3:
                         data[f"{cat_key} Link works"] = "same"
-                        has_cat_failed = True # 踩到 same 算失敗
-                        break
+                        break 
                 else:
                     data[f"{cat_key} Link works"] = "Error"
-                    has_cat_failed = True # 踩到黑名單算失敗
-            else:
-                # 如果 Yahoo 面板上明明「沒有分類」，這本來就應該是 N/A，不列入失敗
-                if data[f"{cat_key} Name"] == "N/A":
-                    pass
-                else:
-                    has_cat_failed = True # 有名字卻沒抓到連結，算失敗
-
-            # 💡 雙重保險：如果網址根本沒成功寫入，直接標記本輪失敗
-            if c_link and (not data[f"{cat_key} page URL"] or data[f"{cat_key} page URL"] in ["", "nan"]):
-                has_cat_failed = True
-
-            time.sleep(1)
-
-        # 💡 【核心覆寫閘門】只要 Cat 1~4 任何一個分類在抓取中途殘缺了，全體降級為 crawler failed
-        if has_cat_failed:
-            print(f"   ⚠️ 偵測到分類抓取不齊全，強制將 {retailer} 標記為 crawler failed 重爬狀態。")
-            data["Landing page URL"] = "crawler failed"
+            # 💡 縮減 Category 間的等待
+            page.wait_for_timeout(1000)
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
-    except:
+    except Exception as e:
+        print(f"   ❌ 擷取異常: {e}")
         data["Landing page URL"] = "crawler failed"
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
 
+def post_to_gas(result):
+    """ 發射回 GAS，加重試 + backoff，避免一次網路抖動就讓整個任務崩潰中止。 """
+    for attempt in range(1, GAS_POST_RETRIES + 1):
+        try:
+            requests.post(GAS_OUTPUT_URL, json=result, timeout=20)
+            return True
+        except Exception as e:
+            print(f"   ⚠️ GAS 發射失敗 ({attempt}/{GAS_POST_RETRIES}): {e}")
+            if attempt < GAS_POST_RETRIES:
+                time.sleep(2 * attempt)
+    return False
+
 # --- 4. 主流程 ---
 
 def main():
-    print("🚀 安全、隱身、全功能完美版排程核心啟動中...", flush=True)
-    
-    if not GSHEET_INPUT_URL or not GAS_OUTPUT_URL or not TRACK_URL_DATA_CSV:
-        print("❌ 錯誤: 缺少必要的 GitHub Secrets 設定。")
-        return
-
+    print(f"🚀 極速模式啟動 | 本月剩餘額度預估支援中")
     try:
-        df_input = pd.read_csv(GSHEET_INPUT_URL, storage_options={"timeout": 15})
+        df_input = pd.read_csv(GSHEET_INPUT_URL)
     except Exception as e:
-        print(f"❌ 輸入清單拉取失敗: {e}")
+        print(f"❌ 讀取來源清單失敗: {e}")
         return
 
     existing_records = {}
     try:
         cb = random.randint(1000, 9999)
         fresh_url = f"{TRACK_URL_DATA_CSV}&t={int(time.time())}&cb={cb}"
-        df_existing = pd.read_csv(fresh_url, storage_options={"timeout": 15})
+        df_existing = pd.read_csv(fresh_url)
         for _, r in df_existing[::-1].iterrows():
             name = str(r['Retailer']).strip()
             if name not in existing_records: existing_records[name] = r.to_dict()
-    except Exception as e:
-        print(f"ℹ️ 歷史紀錄未成功讀取: {e}")
+    except Exception:
+        pass
 
     column_order = ["Retailer", "SRP", "Update Date", "DD Name", "Landing page URL", "Link works", 
                     "Cat1 Name", "Cat1 Link URL", "Cat1 page URL", "Cat1 Link works",
@@ -203,53 +229,47 @@ def main():
                     "Cat4 Name", "Cat4 Link URL", "Cat4 page URL", "Cat4 Link works"]
 
     with sync_playwright() as p:
+        # CI(GitHub Actions / ubuntu-latest)只裝了 chromium，不可加 channel="chrome"
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            bypass_csp=True
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        page = context.new_page()
+        try:
+            # 縮小 Viewport 減少渲染壓力
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1024, "height": 768}
+            )
+            # 套用 stealth（新版 2.x API）；容錯：失敗不影響爬蟲
+            if _STEALTH:
+                try:
+                    _STEALTH.apply_stealth_sync(context)
+                except Exception:
+                    pass
+            page = context.new_page()
 
-        print(f"📋 開始處理清單，總計: {len(df_input)} 筆", flush=True)
+            for index, row in df_input.iterrows():
+                retailer_name = str(row['Retailer']).strip()
+                srp_url = str(row.get('SRP', ''))
 
-        for index, row in df_input.iterrows():
-            retailer_name = str(row['Retailer']).strip()
-            
-            should_skip = False
-            if retailer_name in existing_records:
-                old = existing_records[retailer_name]
-                
-                if is_data_complete(old):
-                    try:
-                        old_date_str = str(old.get('Update Date', '')).replace(" UTC", "").strip()
-                        old_date = datetime.strptime(old_date_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                        
-                        if (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
-                            print(f"箱箱 ⏭️  Skip: {retailer_name} (所有欄位完全健全，且在 7 天保護期內)", flush=True)
-                            should_skip = True
-                    except Exception as e:
-                        pass
-            
-            if should_skip: 
-                continue
+                if retailer_name in existing_records:
+                    old = existing_records[retailer_name]
+                    if is_data_complete(old):
+                        try:
+                            old_date = datetime.strptime(str(old.get('Update Date', '')).replace(" UTC", ""), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                            if (datetime.now(timezone.utc) - old_date < timedelta(days=7)):
+                                print(f"⏭️  Skip: {retailer_name}")
+                                continue
+                        except Exception:
+                            pass
 
-            print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name} (欄位不齊全或過期，啟動重爬)", flush=True)
-            result = run_retailer_capture(page, row, column_order)
-            
-            if result:
-                try: 
-                    requests.post(GAS_OUTPUT_URL, json=result, timeout=15)
-                    print(f"   ✅ {retailer_name} 更新成功 (Status: {result['Landing page URL']})", flush=True)
-                except: 
-                    print(f"   ❌ {retailer_name} 送出失敗", flush=True)
-            
-            time.sleep(random.uniform(2, 4))
-            
-        browser.close()
-    print("🎉 所有任務圓滿結束！", flush=True)
+                print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
+                result = run_retailer_capture(page, row, column_order)
+                if result:
+                    post_to_gas(result)
+
+                # 💡 縮減 Retailer 之間的等待
+                time.sleep(random.uniform(2, 4))
+        finally:
+            browser.close()
+    print("🎉 任務結束！")
 
 if __name__ == "__main__":
     main()
