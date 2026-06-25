@@ -21,7 +21,7 @@ from collections import Counter
 # 優先讀 GitHub Secrets 注入的環境變數；本機/未設定時退回寫死的預設值。
 # 如此 workflow 裡映射的 Secrets 才會真正生效，網址也不必硬編在程式碼裡。
 _DEFAULT_GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
-_DEFAULT_GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbwfA2vP2hdACwsEei73OSQUEojmXFRyyKqu_NcsDFi0Mp7oU2_fTUB1DCM2x4oFMWt7tA/exec"
+_DEFAULT_GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
 _DEFAULT_TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=0&single=true&output=csv"
 
 GSHEET_INPUT_URL = os.environ.get("GSHEET_INPUT_URL") or _DEFAULT_GSHEET_INPUT_URL
@@ -43,6 +43,10 @@ DD_DETECT_ATTEMPTS = 2          # DD 抓不到時的重載重試總次數
 SRP_SETTLE_RANGE = (2.5, 5.0)   # 進 SRP 後等待頁面穩定的隨機秒數
 LOAD_SETTLE_TIMEOUT = 8000      # 讀 title 前等待導航穩定的毫秒上限
 GAS_POST_RETRIES = 3            # 發射回 GAS 的重試次數
+LANDING_RETRY = 1               # 落地跳轉停在中繼網域時的重試次數（設 0 可關閉，只對失敗筆加時間）
+LANDING_RETRY_PAUSE = 3         # 落地重試前的暫停秒數
+RETAILER_GAP_RANGE = (5, 12)    # 廠商之間的隨機間隔秒數（限流綁 IP 與間隔無關，故用較短值省時間）
+WARMUP_URL = "https://www.yahoo.com/"  # 開跑前暖機訪問，取得 cookie/consent 讓 session 更像真人
 
 # --- 2. 工具函式 ---
 
@@ -103,6 +107,16 @@ def wait_for_redirect_smart(page, initial_url, retailer_name):
         page.wait_for_timeout(1500)
     return resp
 
+def _url_key(url):
+    """ 取 hostname + 路徑(去尾斜線、忽略 query) 當作頁面識別。
+        用來判斷分類是否導到與落地相同的頁面——比標題可靠（標題常被品牌名/
+        反爬頁如 'Bot or Not?' 汙染，使不同分類頁看起來相同）。 """
+    try:
+        u = urlparse(str(url).lower())
+        return (u.hostname or "") + (u.path or "").rstrip("/")
+    except Exception:
+        return str(url).lower()
+
 # --- 3. 核心抓取函式 ---
 
 def run_retailer_capture(page, row, column_order):
@@ -142,12 +156,21 @@ def run_retailer_capture(page, row, column_order):
         # Step 2: Landing Page
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
         if landing_raw:
-            wait_for_redirect_smart(page, landing_raw[0], retailer)
+            # 落地停在中繼網域時重試跳轉：限流多為瞬時，單獨重跑常能成功。
+            # 只重試「落地」這一跳，且只在失敗時才花時間，成功的廠商完全不受影響。
+            for attempt in range(LANDING_RETRY + 1):
+                wait_for_redirect_smart(page, landing_raw[0], retailer)
+                if not is_intermediate_domain(page.url):
+                    break
+                if attempt < LANDING_RETRY:
+                    print(f"   ↻ {retailer} 落地停在中繼網域，{LANDING_RETRY_PAUSE}s 後重試跳轉...")
+                    time.sleep(LANDING_RETRY_PAUSE)
+
             if not is_intermediate_domain(page.url):
                 data["Landing page URL"] = page.url
                 data["Link works"] = "Yes"
-                # 標題淨化 (處理 State Farm 重複標題)
-                titles_map["Landing"] = _safe_title(page)
+                # 記錄落地頁的網址路徑，供分類斷路器比對（取代不可靠的標題比對）
+                titles_map["Landing"] = _url_key(page.url)
             else:
                 data["Landing page URL"] = "crawler failed"
 
@@ -171,11 +194,12 @@ def run_retailer_capture(page, row, column_order):
                     data[f"{cat_key} page URL"] = page.url
                     data[f"{cat_key} Link works"] = "Yes"
                     
-                    # 💡 標題斷路器：偵測到導回首頁立刻停止後續 Category
-                    curr_t = _safe_title(page)
-                    if curr_t == titles_map.get("Landing") and len(curr_t) > 3:
+                    # 💡 路徑斷路器：只有當分類「網址路徑」與落地相同(真的導回同一頁)才停止；
+                    #    各分類有自己的目標頁(/Hotels、/Flights…)時路徑不同，會正常繼續往下抓。
+                    curr_key = _url_key(page.url)
+                    if curr_key and curr_key == titles_map.get("Landing"):
                         data[f"{cat_key} Link works"] = "same"
-                        break 
+                        break
                 else:
                     data[f"{cat_key} Link works"] = "Error"
             # 💡 縮減 Category 間的等待
@@ -245,6 +269,14 @@ def main():
                     pass
             page = context.new_page()
 
+            # 🔥 暖機：開跑前先訪問 Yahoo 首頁，取得 cookie/consent，讓後續請求更像正常使用者
+            try:
+                page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(random.randint(2000, 4000))
+                print("🔥 暖機完成，開始爬取")
+            except Exception:
+                pass
+
             for index, row in df_input.iterrows():
                 retailer_name = str(row['Retailer']).strip()
                 srp_url = str(row.get('SRP', ''))
@@ -263,10 +295,14 @@ def main():
                 print(f"🔍 ({index+1}/{len(df_input)}) Processing: {retailer_name}")
                 result = run_retailer_capture(page, row, column_order)
                 if result:
+                    # 與 _CL 一致：帶 mode 讓 GAS 走「依 Retailer 就地覆蓋」分支
+                    # （GAS 的無 mode else 分支是空的，不帶 mode 會寫不進去）
+                    result["mode"] = "update_by_retailer"
+                    print(f"   → 結果: {result.get('Landing page URL','')}")
                     post_to_gas(result)
 
-                # 💡 縮減 Retailer 之間的等待
-                time.sleep(random.uniform(2, 4))
+                # 拉長 Retailer 之間的隨機間隔，大幅降低被限流的機率
+                time.sleep(random.uniform(*RETAILER_GAP_RANGE))
         finally:
             browser.close()
     print("🎉 任務結束！")
