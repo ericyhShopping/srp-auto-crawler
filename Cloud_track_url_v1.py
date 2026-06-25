@@ -48,6 +48,11 @@ LANDING_RETRY_PAUSE = 3         # 落地重試前的暫停秒數
 RETAILER_GAP_RANGE = (5, 12)    # 廠商之間的隨機間隔秒數（限流綁 IP 與間隔無關，故用較短值省時間）
 WARMUP_URL = "https://www.yahoo.com/"  # 開跑前暖機訪問，取得 cookie/consent 讓 session 更像真人
 
+# 模擬美國使用者的瀏覽器地區指紋（IP 仍以實際執行環境為準，這層只統一語言/時區）
+US_LOCALE = "en-US"
+US_TIMEZONE = "America/New_York"
+US_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
@@ -227,8 +232,19 @@ def post_to_gas(result):
 
 # --- 4. 主流程 ---
 
+def _print_geo():
+    # 印出對外 IP 與國家，方便在 GitHub Actions log 確認是否從美國 IP 執行
+    try:
+        j = requests.get("https://ipinfo.io/json", timeout=10).json()
+        print(f"🌐 對外 IP: {j.get('ip')} | 國家: {j.get('country')} | 地區: {j.get('region')}")
+        if j.get("country") != "US":
+            print("⚠️ 注意：目前非美國 IP，結果可能與美國使用者不同！")
+    except Exception as e:
+        print(f"🌐 IP 國家檢查略過: {e}")
+
 def main():
     print(f"🚀 極速模式啟動 | 本月剩餘額度預估支援中")
+    _print_geo()
     try:
         df_input = pd.read_csv(GSHEET_INPUT_URL)
     except Exception as e:
@@ -259,7 +275,10 @@ def main():
             # 縮小 Viewport 減少渲染壓力
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1024, "height": 768}
+                viewport={"width": 1024, "height": 768},
+                locale=US_LOCALE,
+                timezone_id=US_TIMEZONE,
+                extra_http_headers={"Accept-Language": US_ACCEPT_LANGUAGE}
             )
             # 套用 stealth（新版 2.x API）；容錯：失敗不影響爬蟲
             if _STEALTH:
