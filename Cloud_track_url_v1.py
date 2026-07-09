@@ -33,7 +33,7 @@ TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV") or _DEFAULT_TRACK_URL_
 INTERMEDIATE_DOMAIN_BLACKLIST = [
     "yahoo.com", "viglink.com", "sovrn.com", "linkbux.com",
     "financebuzz.com", "validclick.net", "shophermedia.net",
-    "clickroll.net", "rover.ebay.com"
+    "clickroll.net", "rover.ebay.com", "ampxdirect.com"
 ]
 # 錯誤/非正常頁面標記：比對整條 URL（scheme 或錯誤字串）
 INTERMEDIATE_URL_MARKERS = ["chrome-error://", "chromewebdata", "access-denied"]
