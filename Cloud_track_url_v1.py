@@ -11,7 +11,9 @@ except Exception:
     _STEALTH = None
 from lxml import html
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote, parse_qs
+import re
+import base64
 import requests
 import json
 import random
@@ -33,9 +35,10 @@ TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV") or _DEFAULT_TRACK_URL_
 INTERMEDIATE_DOMAIN_BLACKLIST = [
     "yahoo.com", "viglink.com", "sovrn.com", "linkbux.com",
     "financebuzz.com", "validclick.net", "shophermedia.net",
-    "clickroll.net", "rover.ebay.com", "ampxdirect.com",
+    "clickroll.net", "rover.ebay.com", "ampxdirect.com", "rd.bizrate.com",
     "top-best.com",   # 搜尋套利/廣告轉址落地頁（RSOC，非真實零售商本站）
-    "digidip.net"     # 聯盟行銷連結變現/追蹤跳板（同 viglink/sovrn 性質）
+    "digidip.net",    # 聯盟行銷連結變現/追蹤跳板（同 viglink/sovrn 性質）
+    "pureleads.com"   # 潛在客戶開發/搜尋套利服務（非真實零售商本站）
 ]
 # 錯誤/非正常頁面標記：比對整條 URL（scheme 或錯誤字串）
 INTERMEDIATE_URL_MARKERS = ["chrome-error://", "chromewebdata", "access-denied"]
@@ -47,7 +50,12 @@ LOAD_SETTLE_TIMEOUT = 8000      # 讀 title 前等待導航穩定的毫秒上限
 GAS_POST_RETRIES = 3            # 發射回 GAS 的重試次數
 LANDING_RETRY = 1               # 落地跳轉停在中繼網域時的重試次數（設 0 可關閉，只對失敗筆加時間）
 LANDING_RETRY_PAUSE = 3         # 落地重試前的暫停秒數
+CAT_RETRY = 3                   # 單一分類判 same/Error 時，重新點擊 re-roll 聯盟商的重試次數（設 0 可關閉）
+CAT_RETRY_PAUSE = 2             # 分類重試前的暫停秒數
 RETAILER_GAP_RANGE = (5, 12)    # 廠商之間的隨機間隔秒數（限流綁 IP 與間隔無關，故用較短值省時間）
+# 例外廠商（關鍵字，小寫比對）：來源 DD 連結本身就重複/錯誤（人工點擊也導到同一頁），
+# 非反爬造成，重試無用。列此清單者直接跳過抓取，避免浪費重試與誤標，也不覆蓋既有資料。
+EXCEPTION_RETAILERS = ["aarp"]
 WARMUP_URL = "https://www.yahoo.com/"  # 開跑前暖機訪問，取得 cookie/consent 讓 session 更像真人
 
 # 模擬美國使用者的瀏覽器地區指紋（IP 仍以實際執行環境為準，這層只統一語言/時區）
@@ -124,6 +132,61 @@ def _url_key(url):
     except Exception:
         return str(url).lower()
 
+def _reg_domain(url):
+    """ 取「可註冊網域」(hostname 最後兩段，如 www.fanatics.com → fanatics.com)。
+        用於「同網域規則」：分類必須落在 retailer 自己的網域才算真 Yes，
+        落在外部網域(套利/追蹤站)一律視為未落地 → 觸發重試/推測/中繼待判。 """
+    try:
+        host = urlparse(str(url).lower()).hostname or ""
+    except Exception:
+        return ""
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+# 中繼/追蹤網址常把「真正的目的地」藏在這些 query 參數裡（URL 編碼或 Base64）：
+#   t=(bizrate)、lp=(boostclscale)、product_url=(peakoptions)、eu=(digidip) 等
+EMBEDDED_TARGET_PARAMS = [
+    "t", "lp", "product_url", "url", "u", "murl", "ru",
+    "dest", "destination", "target", "redirect", "r", "eu"
+]
+
+def _try_b64_url(s):
+    """ 試著把字串當 Base64/base64url 解碼，看裡面是不是網址（或含網址的 JSON） """
+    try:
+        pad = s + "=" * (-len(s) % 4)
+        dec = base64.urlsafe_b64decode(pad).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    if dec.lower().startswith("http"):
+        return dec
+    m = re.search(r'https?://[^\s"\\]+', dec)
+    return m.group(0) if m else ""
+
+def extract_embedded_target(url):
+    """ 從中繼/追蹤網址的 query 參數，盡量還原它「本來要導去」的真實網址。
+        支援 URL 百分比編碼（含雙重編碼）與 Base64；還原不出來就回空字串。 """
+    try:
+        qs = parse_qs(urlparse(str(url)).query)
+    except Exception:
+        return ""
+    for key in EMBEDDED_TARGET_PARAMS:
+        if key not in qs or not qs[key]:
+            continue
+        raw = qs[key][0]
+        for _ in range(2):
+            if raw.lower().startswith("http"):
+                return raw
+            dec = unquote(raw)
+            if dec == raw:
+                break
+            raw = dec
+        if raw.lower().startswith("http"):
+            return raw
+        cand = _try_b64_url(qs[key][0])
+        if cand:
+            return cand
+    return ""
+
 # --- 3. 核心抓取函式 ---
 
 def run_retailer_capture(page, row, column_order):
@@ -132,6 +195,9 @@ def run_retailer_capture(page, row, column_order):
     data = {col: "" for col in column_order}
     data["Retailer"], data["SRP"] = retailer, srp_url
     titles_map = {}
+    landing_domain = ""  # retailer 落地頁的可註冊網域；分類必須落在此網域才算真 Yes（同網域規則）
+    # 例外廠商：來源 DD 連結本身重複(人工點擊亦同)。繞過 same 限制、照抓重複資料，不判失敗。
+    is_exception = any(x in retailer.lower() for x in EXCEPTION_RETAILERS)
 
     try:
         # Step 1: Yahoo SRP
@@ -162,9 +228,9 @@ def run_retailer_capture(page, row, column_order):
 
         # Step 2: Landing Page
         landing_raw = tree.xpath("//div[contains(@class,'compTitle')]/h3/a/@href")
+        # 落地停在黑名單中繼站時重試逃離（限流多為瞬時，重跑常能成功）
+        landing_url = ""
         if landing_raw:
-            # 落地停在中繼網域時重試跳轉：限流多為瞬時，單獨重跑常能成功。
-            # 只重試「落地」這一跳，且只在失敗時才花時間，成功的廠商完全不受影響。
             for attempt in range(LANDING_RETRY + 1):
                 wait_for_redirect_smart(page, landing_raw[0], retailer)
                 if not is_intermediate_domain(page.url):
@@ -172,45 +238,114 @@ def run_retailer_capture(page, row, column_order):
                 if attempt < LANDING_RETRY:
                     print(f"   ↻ {retailer} 落地停在中繼網域，{LANDING_RETRY_PAUSE}s 後重試跳轉...")
                     time.sleep(LANDING_RETRY_PAUSE)
+            landing_url = page.url or ""
 
-            if not is_intermediate_domain(page.url):
-                data["Landing page URL"] = page.url
-                data["Link works"] = "Yes"
-                # 記錄落地頁的網址路徑，供分類斷路器比對（取代不可靠的標題比對）
-                titles_map["Landing"] = _url_key(page.url)
-            else:
+        # 先收集各分類最終網址與推測目的地（網域判定延後到「多數決」之後）。
+        # 逃離條件只看「非黑名單中繼站 且 非與落地完全相同頁」；真正的 retailer 網域稍後才決定。
+        landing_key0 = _url_key(landing_url) if (landing_url and not is_intermediate_domain(landing_url)) else None
+        cats = []
+        for i in range(1, 5):
+            c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
+            c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
+            name = c_name[0] if c_name else "N/A"
+            if not c_link:
+                cats.append({"key": f"Cat{i}", "name": name, "link": None, "url": "", "intended": ""})
+                continue
+            curr_url = ""
+            for attempt in range(CAT_RETRY + 1):
+                wait_for_redirect_smart(page, c_link[0], retailer)
+                curr_url = page.url
+                # 逃離中繼站/同落地頁；例外廠商連結重複，接受 same 不再重試逃離
+                if not is_intermediate_domain(curr_url) and (is_exception or not (landing_key0 and _url_key(curr_url) == landing_key0)):
+                    break
+                if attempt < CAT_RETRY:
+                    print(f"   ↻ {retailer} Cat{i} 停在中繼/同落地頁，{CAT_RETRY_PAUSE}s 後重抽聯盟商重試 ({attempt+1}/{CAT_RETRY})...")
+                    time.sleep(CAT_RETRY_PAUSE)
+            cats.append({"key": f"Cat{i}", "name": name, "link": c_link[0],
+                         "url": curr_url, "intended": extract_embedded_target(curr_url)})
+            page.wait_for_timeout(1000)
+
+        # 🧭 多數決決定 retailer 可註冊網域：候選 = 落地 + 各分類最終網址 + 各分類推測目的地（排除黑名單中繼站）。
+        #    「落地被套利站/內容農場洗掉、但分類一致指向本站」時，多數會落在真正的 retailer 網域；
+        #    離群的內容農場落地不會被採信，真分類也不再被同網域規則誤殺。
+        domain_votes = Counter()
+        for u in [landing_url] + [c["url"] for c in cats] + [c["intended"] for c in cats]:
+            if u and not is_intermediate_domain(u):
+                d = _reg_domain(u)
+                if d:
+                    domain_votes[d] += 1
+        retailer_domain = domain_votes.most_common(1)[0][0] if domain_votes else ""
+        landing_domain = retailer_domain
+        if len(domain_votes) > 1:
+            print(f"   🧭 {retailer} retailer 網域(多數決)={retailer_domain} 票數={dict(domain_votes)}")
+
+        def _judge(u, intended):
+            # 回傳 (verdict, 要記錄的網址)。verdict: Yes / Yes(推測) / 中繼待判 / Error
+            if u and not is_intermediate_domain(u) and retailer_domain and _reg_domain(u) == retailer_domain:
+                return "Yes", u
+            if intended and not is_intermediate_domain(intended) \
+                    and (not retailer_domain or _reg_domain(intended) == retailer_domain):
+                return "Yes(推測)", intended
+            is_err = any(m in str(u).lower() for m in INTERMEDIATE_URL_MARKERS)
+            if u and str(u).lower().startswith("http") and not is_err:
+                return "中繼待判", u  # 只抓到中繼站、挖不出真實網址：保留供人工/AI 判斷
+            return "Error", ""
+
+        # 判定落地
+        if landing_url:
+            lv, lstore = _judge(landing_url, extract_embedded_target(landing_url))
+            if lv == "Error":
                 data["Landing page URL"] = "crawler failed"
+            else:
+                data["Landing page URL"] = lstore
+                data["Link works"] = "Yes" if lv == "Yes" else lv
+                titles_map["Landing"] = _url_key(lstore)
+                if lv != "Yes":
+                    print(f"   🔎 {retailer} 落地={lv}: {lstore[:140]}")
+        else:
+            data["Landing page URL"] = "crawler failed"
 
-        # 💡 額度斷路器：Landing 失敗則不跑 Categories，現省 4 次跳轉時間
+        # 💡 額度斷路器：Landing 失敗則不跑 Categories 判定
         if data["Landing page URL"] == "crawler failed":
             data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             return data
 
-        # Step 3: Categories
-        for i in range(1, 5):
-            c_link = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a/@href")
-            c_name = tree.xpath(f"//div[contains(@class,'TopNavCommerce')]/div[3]//li[{i}]//a//img/@alt")
-            cat_key = f"Cat{i}"
-            data[f"{cat_key} Name"] = c_name[0] if c_name else "N/A"
-            
-            if c_link:
-                data[f"{cat_key} Link URL"] = c_link[0]
-                wait_for_redirect_smart(page, c_link[0], retailer)
-                
-                if not is_intermediate_domain(page.url):
-                    data[f"{cat_key} page URL"] = page.url
-                    data[f"{cat_key} Link works"] = "Yes"
-                    
-                    # 💡 路徑斷路器：只有當分類「網址路徑」與落地相同(真的導回同一頁)才停止；
-                    #    各分類有自己的目標頁(/Hotels、/Flights…)時路徑不同，會正常繼續往下抓。
-                    curr_key = _url_key(page.url)
-                    if curr_key and curr_key == titles_map.get("Landing"):
-                        data[f"{cat_key} Link works"] = "same"
-                        break
-                else:
-                    data[f"{cat_key} Link works"] = "Error"
-            # 💡 縮減 Category 間的等待
-            page.wait_for_timeout(1000)
+        # 判定各分類（用多數決出來的 retailer_domain）
+        has_cat_failed = False
+        for c in cats:
+            cat_key, name = c["key"], c["name"]
+            data[f"{cat_key} Name"] = name
+            if c["link"] is None:
+                if name != "N/A":
+                    has_cat_failed = True
+                continue
+            data[f"{cat_key} Link URL"] = c["link"]
+            u, intended = c["url"], c["intended"]
+            if u and not is_intermediate_domain(u) and _url_key(u) == titles_map.get("Landing"):
+                cv, cstore = "same", u  # 導回與落地完全相同頁
+            else:
+                cv, cstore = _judge(u, intended)
+            if cv == "Yes":
+                data[f"{cat_key} page URL"] = cstore
+                data[f"{cat_key} Link works"] = "Yes"
+            elif cv == "Yes(推測)":
+                data[f"{cat_key} page URL"] = cstore
+                data[f"{cat_key} Link works"] = "Yes(推測)"
+                print(f"   🔎 {retailer} {cat_key} 改用參數推測目的地: {cstore[:140]}")
+            elif cv == "中繼待判":
+                data[f"{cat_key} page URL"] = cstore
+                data[f"{cat_key} Link works"] = "中繼待判"
+                print(f"   🔎 {retailer} {cat_key} 只抓到中繼站，先保留供判斷: {cstore[:140]}")
+            elif cv == "same" and is_exception:
+                # 例外廠商：來源連結重複，繞過 same 限制、照抓重複資料，不判整筆失敗
+                data[f"{cat_key} page URL"] = cstore
+                data[f"{cat_key} Link works"] = "same"
+            else:  # same(非例外) 或 Error
+                data[f"{cat_key} Link works"] = cv
+                has_cat_failed = True
+
+        if has_cat_failed:
+            data["Landing page URL"] = "crawler failed"
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
