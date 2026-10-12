@@ -1,0 +1,18 @@
+# --- 機密：務必不要 commit ---
+# 程式會讀同層的 .env（KEY=VALUE）取得 GAS 端點與試算表網址。
+# GAS 端點外洩等於讓任何人都能對試算表寫入，且進了 git 歷史就清不掉。
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- 執行產物 ---
+logs/
+*.log
+
+# --- macOS ---
+.DS_Store
