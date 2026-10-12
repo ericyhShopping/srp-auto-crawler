@@ -20,15 +20,36 @@ import random
 from collections import Counter
 
 # --- 1. 設定區域 ---
-# 優先讀 GitHub Secrets 注入的環境變數；本機/未設定時退回寫死的預設值。
-# 如此 workflow 裡映射的 Secrets 才會真正生效，網址也不必硬編在程式碼裡。
-_DEFAULT_GSHEET_INPUT_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=1643541848&single=true&output=csv"
-_DEFAULT_GAS_OUTPUT_URL = "https://script.google.com/macros/s/AKfycbyHzJ9JEC-8AuEJmcpZpjXdpfVrKcMmO3pvstNvZQyv-_c0jlmoqBHt4jnW3IwrDiK0Hg/exec"
-_DEFAULT_TRACK_URL_DATA_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRYb03CvtlCo6M_xaOC9SfReKwH7CNGcMabekpH9y0tHN_0tM7GP13qfNDovd_XekUbkzU4Q6dgS8xr/pub?gid=0&single=true&output=csv"
+# 三個網址一律從環境變數讀，程式碼裡不留預設值。這個 repo 會公開，而 GAS 端點外洩
+# 等於讓任何人都能對試算表寫入；一旦 commit 進 git 歷史就清不掉（只能換端點）。
+#   本機執行       ：在本檔同層放一個 .env，一行一組 KEY=VALUE（.env 已列入 .gitignore）
+#   GitHub Actions ：設在 repo Settings → Secrets，再由 workflow 的 env: 映射進來
+# 需要的三個變數：GSHEET_INPUT_URL / GAS_OUTPUT_URL / TRACK_URL_DATA_CSV
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(_ENV_FILE):
+    # 極簡 .env 解析（不引入 python-dotenv 依賴）：一行一組 KEY=VALUE，# 開頭是註解。
+    # 用 setdefault，讓已存在的環境變數（如 CI 注入的 Secrets）優先，不被 .env 蓋掉。
+    with open(_ENV_FILE, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
 
-GSHEET_INPUT_URL = os.environ.get("GSHEET_INPUT_URL") or _DEFAULT_GSHEET_INPUT_URL
-GAS_OUTPUT_URL = os.environ.get("GAS_OUTPUT_URL") or _DEFAULT_GAS_OUTPUT_URL
-TRACK_URL_DATA_CSV = os.environ.get("TRACK_URL_DATA_CSV") or _DEFAULT_TRACK_URL_DATA_CSV
+_REQUIRED_ENV = ("GSHEET_INPUT_URL", "GAS_OUTPUT_URL", "TRACK_URL_DATA_CSV")
+_MISSING_ENV = [_k for _k in _REQUIRED_ENV if not os.environ.get(_k)]
+if _MISSING_ENV:
+    raise SystemExit(
+        "❌ 缺少必要的環境變數：" + ", ".join(_MISSING_ENV) + "\n"
+        "   本機：在程式同層建一個 .env，一行一組 KEY=VALUE\n"
+        "   CI  ：在 repo Settings → Secrets and variables → Actions 設定，"
+        "並在 workflow 的 env: 區塊映射過來"
+    )
+
+GSHEET_INPUT_URL = os.environ["GSHEET_INPUT_URL"]
+GAS_OUTPUT_URL = os.environ["GAS_OUTPUT_URL"]
+TRACK_URL_DATA_CSV = os.environ["TRACK_URL_DATA_CSV"]
 
 # 中繼/失敗的「真實網域」黑名單：只比對 hostname，避免落地頁追蹤參數
 # (force_referer=search.yahoo.com、pname-Yahoo 等) 把真正落地頁誤判成中繼。
@@ -38,13 +59,35 @@ INTERMEDIATE_DOMAIN_BLACKLIST = [
     "clickroll.net", "rover.ebay.com", "ampxdirect.com", "rd.bizrate.com",
     "top-best.com",   # 搜尋套利/廣告轉址落地頁（RSOC，非真實零售商本站）
     "digidip.net",    # 聯盟行銷連結變現/追蹤跳板（同 viglink/sovrn 性質）
-    "pureleads.com"   # 潛在客戶開發/搜尋套利服務（非真實零售商本站）
+    "pureleads.com",  # 潛在客戶開發/搜尋套利服務（非真實零售商本站）
+    "affinity.net",   # Yahoo adslib 點擊轉址器(ww2.affinity.net/fly1)；有時會往下跳、有時卡住
+    # SRVTRCK（前 Yieldkit，德國漢堡）的聯盟追蹤跳板，同 viglink/sovrn/digidip 性質。
+    # 2026-09-17 加入：曾兩次贏下多數決被當成 retailer 網域（Temu 4:3、L.L. Bean 4:1），
+    # 導致分類誤標 Yes / 正確落地被誤判。根路徑回 200 不轉址，只能靠網域比對。
+    "linksprf.com",
+    # 搜尋套利落地頁（RSOC），同 top-best.com 性質。2026-09-22 實測確認是死路：
+    # /monetize?b=<brand> 302 回它自己首頁，渲染出通用優惠目錄
+    # （title "Best offers | shoppingwaves.net"），不會往零售商本站跳。
+    "shoppingwaves.net",
+    # 同一個廣告商的轉址基礎設施，Temu / Maurices 的落地都曾停在上面。
+    # 2026-10-01 復驗 Temu 三次各抽到不同轉址器（birgi-zqq → tre9 → temu.com 直達），
+    # 證實是聯盟商輪替。加黑名單讓它觸發 LANDING_RETRY 自動重抽，當輪就有機會救回。
+    "birgi-zqq.com",  # /zokvisitor/<uuid>/... 轉址器
+    "tre9.com"        # zp.tre9.com/<uuid>?target=alpha-low-... 轉址器
 ]
 # 錯誤/非正常頁面標記：比對整條 URL（scheme 或錯誤字串）
 INTERMEDIATE_URL_MARKERS = ["chrome-error://", "chromewebdata", "access-denied"]
 
 DD_WAIT_TIMEOUT = 8000          # 等 DD 元素出現的毫秒上限
 DD_DETECT_ATTEMPTS = 2          # DD 抓不到時的重載重試總次數
+# 等待跳轉時的輪詢次數。窗口 = ROUNDS × INTERVAL，且是「page.goto 返回之後」才開始算。
+# 2026-09-09 Kohl's 實測：goto 在 shophermedia click.track 返回(4.4~5.7s)，該頁要跑完 IPQS
+# 風控才往下跳，kohls.com 要到第 6~7 輪才 commit，提早返回還要多一輪確認 → 恰好第 7~8 輪。
+# 舊值 6（9 秒）根本不夠，Kohl's 會停在 click.track 被標成中繼待判。
+# 代價：真死的連結（affinity fly1 404）每次都會把窗口燒滿，每條 +9 秒。
+REDIRECT_POLL_ROUNDS = 12       # 一般廠商的輪詢次數（18 秒窗口）
+REDIRECT_POLL_ROUNDS_EBAY = 3   # eBay 另有 ebay.com 斷路器，維持極速不動
+REDIRECT_POLL_INTERVAL = 1500   # 每輪等待毫秒
 SRP_SETTLE_RANGE = (2.5, 5.0)   # 進 SRP 後等待頁面穩定的隨機秒數
 LOAD_SETTLE_TIMEOUT = 8000      # 讀 title 前等待導航穩定的毫秒上限
 GAS_POST_RETRIES = 3            # 發射回 GAS 的重試次數
@@ -66,9 +109,15 @@ US_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 # --- 2. 工具函式 ---
 
 def is_data_complete(row_data):
-    """ 觸發爬蟲的核心判斷：由 Landing page URL 決定 """
+    """ 觸發爬蟲的核心判斷：Landing page URL 與 Link works 必須一起看 """
     landing_status = str(row_data.get("Landing page URL", "")).strip()
     if landing_status.lower() in ["", "nan", "crawler failed", "dd cannot be found"]:
+        return False
+    # 2026-10-01 補上：整筆旗標已改寫在 Link works（不再覆寫 Landing page URL，
+    # 以保住「實際停住的位置」）。若只看 Landing page URL，需重跑 / crawler failed
+    # 的列會因為該欄是個真網址而被當成「已完成」，7 天內都不會被重跑 ——
+    # 明明標記需重跑卻不重跑，正好相反。
+    if str(row_data.get("Link works", "")).strip() in ("需重跑", "crawler failed"):
         return False
     return True
 
@@ -107,7 +156,7 @@ def wait_for_redirect_smart(page, initial_url, retailer_name):
 
     last_url = ""
     # 💡 eBay 只要跳轉一次就檢查，不進入長時間循環
-    max_loops = 3 if is_ebay else 6
+    max_loops = REDIRECT_POLL_ROUNDS_EBAY if is_ebay else REDIRECT_POLL_ROUNDS
     for _ in range(max_loops):
         try:
             curr_url = page.url
@@ -119,7 +168,7 @@ def wait_for_redirect_smart(page, initial_url, retailer_name):
         if curr_url == last_url and not is_intermediate_domain(curr_url):
             return resp
         last_url = curr_url
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(REDIRECT_POLL_INTERVAL)
     return resp
 
 def _url_key(url):
@@ -279,21 +328,28 @@ def run_retailer_capture(page, row, column_order):
         if len(domain_votes) > 1:
             print(f"   🧭 {retailer} retailer 網域(多數決)={retailer_domain} 票數={dict(domain_votes)}")
 
-        def _judge(u, intended):
-            # 回傳 (verdict, 要記錄的網址)。verdict: Yes / Yes(推測) / 中繼待判 / Error
+        def _judge(u):
+            # 回傳 (verdict, 要記錄的網址)。verdict: Yes / 需重跑 / Error
+            #
+            # 2026-09-11：移除 Yes(推測) 分支（與 _CL 版同步）。原本會從中繼站的 query 參數
+            # 挖出「它本來要去的網址」當落點回報，但那是**宣告值**不是實際落點 —— 若宣告值
+            # 可採信，這支程式就不必存在：rdlw 的 custData base64 離線解一次就有落地 + 4 個
+            # 分類的全部網址，不必開瀏覽器。而它存在的理由恰好是宣告值 ≠ 實際落點
+            # （zappos 宣告 /kids、實際停在 /null/OgLWL-ICAQc.zso）。
+            # 原則：沒真的到過那一頁，就不能標成 Yes。
             if u and not is_intermediate_domain(u) and retailer_domain and _reg_domain(u) == retailer_domain:
                 return "Yes", u
-            if intended and not is_intermediate_domain(intended) \
-                    and (not retailer_domain or _reg_domain(intended) == retailer_domain):
-                return "Yes(推測)", intended
             is_err = any(m in str(u).lower() for m in INTERMEDIATE_URL_MARKERS)
             if u and str(u).lower().startswith("http") and not is_err:
-                return "中繼待判", u  # 只抓到中繼站、挖不出真實網址：保留供人工/AI 判斷
+                # 沒抵達零售商本站：記錄「實際停住的位置」並標記需重跑。
+                # 網址照留是為了下次查得出上次卡在哪一站，但標籤明示這不是有效落點。
+                return "需重跑", u
             return "Error", ""
 
         # 判定落地
+        landing_needs_rerun = False
         if landing_url:
-            lv, lstore = _judge(landing_url, extract_embedded_target(landing_url))
+            lv, lstore = _judge(landing_url)
             if lv == "Error":
                 data["Landing page URL"] = "crawler failed"
             else:
@@ -301,7 +357,8 @@ def run_retailer_capture(page, row, column_order):
                 data["Link works"] = "Yes" if lv == "Yes" else lv
                 titles_map["Landing"] = _url_key(lstore)
                 if lv != "Yes":
-                    print(f"   🔎 {retailer} 落地={lv}: {lstore[:140]}")
+                    landing_needs_rerun = (lv == "需重跑")
+                    print(f"   🔁 {retailer} 落地={lv}: {lstore[:140]}")
         else:
             data["Landing page URL"] = "crawler failed"
 
@@ -312,6 +369,7 @@ def run_retailer_capture(page, row, column_order):
 
         # 判定各分類（用多數決出來的 retailer_domain）
         has_cat_failed = False
+        has_rerun = landing_needs_rerun
         for c in cats:
             cat_key, name = c["key"], c["name"]
             data[f"{cat_key} Name"] = name
@@ -320,22 +378,19 @@ def run_retailer_capture(page, row, column_order):
                     has_cat_failed = True
                 continue
             data[f"{cat_key} Link URL"] = c["link"]
-            u, intended = c["url"], c["intended"]
+            u = c["url"]
             if u and not is_intermediate_domain(u) and _url_key(u) == titles_map.get("Landing"):
                 cv, cstore = "same", u  # 導回與落地完全相同頁
             else:
-                cv, cstore = _judge(u, intended)
+                cv, cstore = _judge(u)
             if cv == "Yes":
                 data[f"{cat_key} page URL"] = cstore
                 data[f"{cat_key} Link works"] = "Yes"
-            elif cv == "Yes(推測)":
+            elif cv == "需重跑":
                 data[f"{cat_key} page URL"] = cstore
-                data[f"{cat_key} Link works"] = "Yes(推測)"
-                print(f"   🔎 {retailer} {cat_key} 改用參數推測目的地: {cstore[:140]}")
-            elif cv == "中繼待判":
-                data[f"{cat_key} page URL"] = cstore
-                data[f"{cat_key} Link works"] = "中繼待判"
-                print(f"   🔎 {retailer} {cat_key} 只抓到中繼站，先保留供判斷: {cstore[:140]}")
+                data[f"{cat_key} Link works"] = "需重跑"
+                has_rerun = True
+                print(f"   🔁 {retailer} {cat_key} 沒抵達最後一頁，記錄停住位置待重跑: {cstore[:140]}")
             elif cv == "same" and is_exception:
                 # 例外廠商：來源連結重複，繞過 same 限制、照抓重複資料，不判整筆失敗
                 data[f"{cat_key} page URL"] = cstore
@@ -344,8 +399,17 @@ def run_retailer_capture(page, row, column_order):
                 data[f"{cat_key} Link works"] = cv
                 has_cat_failed = True
 
+        # 整筆旗標一律寫在 Link works，不覆寫 Landing page URL。
+        # 2026-09-14：has_cat_failed 原本會把 Landing page URL 蓋成 "crawler failed"，
+        # 連已經抓成功的落地網址一起擦掉，於是「被機器人驗證擋住」和「DD 設定重複」
+        # 在 sheet 上長得一模一樣。保住落地網址才有得區分。
         if has_cat_failed:
-            data["Landing page URL"] = "crawler failed"
+            data["Link works"] = "crawler failed"
+            print(f"   ⛔ {retailer} 整筆標記 crawler failed（有分類判 same/Error）")
+        elif has_rerun:
+            # 只要有任一格沒抵達最後一頁，這一列就不算完成。
+            data["Link works"] = "需重跑"
+            print(f"   🔁 {retailer} 整筆標記需重跑（有格子沒抵達最後一頁）")
 
         data["Update Date"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         return data
@@ -436,6 +500,12 @@ def main():
             for index, row in df_input.iterrows():
                 retailer_name = str(row['Retailer']).strip()
                 srp_url = str(row.get('SRP', ''))
+
+                # 跳過來源表裡的空白列：pandas 會把空儲存格讀成 NaN，str() 之後變字串
+                # "nan"，於是每天都被當成一個叫 nan 的廠商去抓，必然 DD cannot be found。
+                # 2026-10-01 實測 GitHub 近 20 輪有 4 輪在跑這個空列，純浪費額度。
+                if retailer_name.lower() in ("", "nan") or not srp_url.startswith("http"):
+                    continue
 
                 if retailer_name in existing_records:
                     old = existing_records[retailer_name]
